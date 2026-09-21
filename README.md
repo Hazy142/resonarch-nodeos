@@ -2,64 +2,52 @@
 
 Minimal, immutable compute-appliance OS for dedicated FiberFEC / distributed-runtime nodes.
 
-## Purpose
+## NODEOS-001 target
 
-NodeOS turns an otherwise general-purpose PC into a deterministic network compute appliance. The first target is a dual-boot node built around an Intel i7-4770K and NVIDIA GTX 1070 Ti.
+First physical target: Intel Core i7-4770K + NVIDIA GeForce GTX 1070 Ti, dual-booting beside Windows and exposing CPU, RAM, storage, NIC and CUDA capability to the main workstation.
 
-NodeOS is intentionally **not** a second tensor runtime. llama.cpp / GGML remains compute authority. NodeOS exposes bounded CPU, RAM, storage, network and CUDA resources to the distributed runtime and provides evidence, health and lifecycle control.
+NodeOS is **not** a second tensor runtime. llama.cpp / GGML remains compute authority.
 
-## Initial architecture
+## Pinned substrate
 
-```text
-Main workstation / PLEXUS
-        |
-        | direct LAN / later FiberTunnel
-        v
-NodeOS appliance
-  |- node-agent
-  |- FiberFEC object/residency services
-  |- CPU / RAM staging tier
-  |- local persistent object cache
-  |- CUDA execution tier
-  '- watchdog / health / evidence
+- Buildroot **2026.08**
+- verified upstream release commit `d5180309b1b66ef3b8eaccca70ad69be8e0729a1`
+- Linux **6.12.47** baseline from Buildroot's x86_64 EFI profile
+- x86_64 UEFI / GRUB2 / GPT `disk.img`
+- glibc + BusyBox/SysV
+- direct LAN default: NodeOS `192.168.77.2/30`, workstation `192.168.77.1/30`
+
+Build on Linux/WSL2:
+
+```bash
+./scripts/build-nodeos.sh
 ```
 
-## First hardware profile
+Fast configuration gate:
 
-- Intel Core i7-4770K
-- NVIDIA GeForce GTX 1070 Ti
-- Pascal / CUDA compute capability 6.1
-- 1 GbE direct LAN baseline
-- Windows preserved as alternate dual-boot target
+```bash
+./scripts/build-nodeos.sh --configure-only
+```
+
+Artifacts are emitted to `out/artifacts/` with SHA-256 build evidence.
+
+## CUDA boundary
+
+The public repo does not redistribute NVIDIA proprietary binaries. The base image boots without them but remains fail-closed in `DISCOVERED` state. A verified vendor payload plus a successful physical `sm_61` CUDA probe transitions the node to `READY`.
+
+Compile the probe using CUDA 12.x:
+
+```bash
+./scripts/build-cuda-probe.sh
+```
+
+See `vendor/nvidia/README.md` and `docs/NODEOS-001-bringup.md`.
 
 ## Milestones
 
-- **NODEOS-001** — reproducible minimal boot image; CPU, NIC and GPU visible.
-- **NODEOS-002** — node identity, discovery, health and resource inventory.
+- **NODEOS-001** — boot image, direct LAN, inventory, GTX 1070 Ti discovery and CUDA readiness gate.
+- **NODEOS-002** — authenticated node identity, discovery and health telemetry.
 - **NODEOS-003** — FiberFEC object plane and RAM↔GPU residency.
-- **NODEOS-004** — cross-generation determinism gate: CPU == RTX 4060 == GTX 1070 Ti.
-- **NODEOS-005** — llama.cpp/GGML remote consumer integration.
-- **NODEOS-006** — immutable 24/7 appliance mode, watchdog and recovery.
-
-## Design rules
-
-1. Buildroot/Linux is the initial substrate; no custom kernel-from-scratch requirement.
-2. GGML decides compute semantics and tensor need.
-3. FiberFEC manages verified object identity, transfer, repair, lease and residency.
-4. NodeOS must fail closed on identity, evidence or residency contract violations.
-5. Cross-node behavior must be reproducible and evidence-producing.
-6. Windows remains untouched and independently bootable.
-
-## Repository layout
-
-```text
-buildroot/        pinned Buildroot integration and board profile
-config/           immutable NodeOS configuration
-contracts/        node identity / capability / evidence contracts
-docs/             architecture decisions and bring-up notes
-node-agent/       appliance control-plane daemon
-scripts/          build, image and deployment helpers
-tests/            contract and cross-node acceptance gates
-```
-
-Status: bootstrap repository; implementation starts with NODEOS-001.
+- **NODEOS-004** — CPU == RTX 4060 == GTX 1070 Ti cross-generation gate.
+- **NODEOS-005** — llama.cpp/GGML remote consumer.
+- **NODEOS-006** — immutable 24/7 appliance, watchdog and recovery.

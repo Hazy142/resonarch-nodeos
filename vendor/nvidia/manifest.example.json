@@ -1,0 +1,13 @@
+{
+  "schema": "resonarch.nodeos.nvidia-payload.v1",
+  "target_profile": "haswell-gtx1070ti-v1",
+  "target_compute_capability": "6.1",
+  "driver_version": "TO_BE_PINNED",
+  "cuda_probe_compiler": "CUDA 12.x",
+  "files": [
+    {
+      "path": "rootfs/usr/libexec/nodeos-cuda-probe",
+      "sha256": "REPLACE_WITH_SHA256"
+    }
+  ]
+}
