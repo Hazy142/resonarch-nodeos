@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+CONF=/etc/nodeos/nodeos.conf
+[ -r "$CONF" ] && . "$CONF"
+
+find_iface() {
+    if [ -n "${NODEOS_INTERFACE:-}" ] && [ -d "/sys/class/net/$NODEOS_INTERFACE" ]; then
+        printf '%s\n' "$NODEOS_INTERFACE"; return
+    fi
+    for p in /sys/class/net/*; do
+        n=$(basename "$p"); [ "$n" = lo ] && continue
+        printf '%s\n' "$n"; return
+    done
+    return 1
+}
+
+case "${1:-start}" in
+ start)
+    mkdir -p /run/nodeos
+    iface=$(find_iface) || { echo "NodeOS: no network interface found" >&2; exit 1; }
+    ip link set dev "$iface" up
+    if [ "${NODEOS_LINK_MODE:-static}" = "dhcp" ]; then
+        udhcpc -q -n -t 5 -i "$iface"
+    else
+        ip addr flush dev "$iface"
+        ip addr add "${NODEOS_IPV4_CIDR:-192.168.77.2/30}" dev "$iface"
+    fi
+    printf '%s\n' "$iface" > /run/nodeos/interface
+    echo "NodeOS network ready: $iface $(ip -o -4 addr show dev "$iface" | awk '{print $4}')"
+    ;;
+ stop)
+    if [ -r /run/nodeos/interface ]; then
+        iface=$(cat /run/nodeos/interface)
+        ip addr flush dev "$iface" || true
+        ip link set dev "$iface" down || true
+    fi
+    ;;
+ restart) "$0" stop; "$0" start ;;
+ *) echo "usage: $0 {start|stop|restart}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+QUIET=0
+[ "${1:-}" = "--quiet" ] && QUIET=1
+OUT=/run/nodeos/cuda-smoke.json
+mkdir -p /run/nodeos
+
+fail() {
+    reason="$1"
+    printf '{"schema":"resonarch.nodeos.cuda-smoke.v1","status":"FAIL","reason":"%s"}\n' "$reason" > "$OUT"
+    [ "$QUIET" -eq 1 ] || cat "$OUT"
+    exit 1
+}
+
+command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi-missing"
+nvidia-smi -L >/dev/null 2>&1 || fail "driver-not-ready"
+[ -x /usr/libexec/nodeos-cuda-probe ] || fail "cuda-probe-missing"
+
+if /usr/libexec/nodeos-cuda-probe > "$OUT.tmp" 2>/run/nodeos/cuda-probe.stderr; then
+    mv "$OUT.tmp" "$OUT"
+else
+    rm -f "$OUT.tmp"
+    fail "cuda-probe-failed"
+fi
+
+grep -q '"status":"PASS"' "$OUT" || fail "cuda-probe-nonpass"
+[ "$QUIET" -eq 1 ] || cat "$OUT"

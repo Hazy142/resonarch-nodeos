@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://resonarch.example/contracts/nodeos-001-evidence-v1.schema.json",
+  "title": "NODEOS-001 build evidence",
+  "type": "object",
+  "required": ["schema","nodeos_commit","buildroot_version","buildroot_commit","profile","artifacts"],
+  "properties": {
+    "schema": { "const": "resonarch.nodeos.build-evidence.v1" },
+    "nodeos_commit": { "type": "string", "minLength": 7 },
+    "buildroot_version": { "const": "2026.08" },
+    "buildroot_commit": { "const": "d5180309b1b66ef3b8eaccca70ad69be8e0729a1" },
+    "profile": { "const": "haswell-gtx1070ti-v1" },
+    "artifacts": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["name","bytes","sha256"],
+        "properties": {
+          "name": { "type": "string" },
+          "bytes": { "type": "integer", "minimum": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  }
+}
