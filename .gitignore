@@ -1,0 +1,8 @@
+out/
+build/
+dl/
+.cache/
+*.img
+*.iso
+*.log
+.env
