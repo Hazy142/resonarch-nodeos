@@ -1,0 +1,21 @@
+schema: resonarch.nodeos.hardware-profile.v1
+id: haswell-gtx1070ti-v1
+cpu:
+  family: Intel Haswell
+  model: Core i7-4770K
+gpu:
+  vendor: NVIDIA
+  model: GeForce GTX 1070 Ti
+  architecture: Pascal
+  compute_capability: "6.1"
+network:
+  baseline: 1GbE
+boot:
+  mode: dual-boot
+  preserve_existing_windows: true
+roles:
+  - cpu_compute
+  - ram_staging
+  - persistent_object_cache
+  - cuda_compute
+  - verified_residency
