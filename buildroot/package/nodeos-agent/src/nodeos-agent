@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+CONF=/etc/nodeos/nodeos.conf
+[ -r "$CONF" ] && . "$CONF"
+NODE_ID=${NODEOS_NODE_ID:-haswell-gtx1070ti-01}
+INTERVAL=${NODEOS_AGENT_INTERVAL:-10}
+OUT=/run/nodeos/capability.json
+mkdir -p /run/nodeos
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'; }
+
+first_iface() {
+    if [ -n "${NODEOS_INTERFACE:-}" ] && [ -d "/sys/class/net/$NODEOS_INTERFACE" ]; then
+        printf '%s\n' "$NODEOS_INTERFACE"; return
+    fi
+    for p in /sys/class/net/*; do
+        n=$(basename "$p"); [ "$n" = "lo" ] && continue
+        printf '%s\n' "$n"; return
+    done
+    printf '%s\n' "unknown"
+}
+
+collect_once() {
+    tmp="$OUT.tmp"
+    cpu_model=$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+    cpu_logical=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)
+    mem_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    kernel=$(uname -r)
+    iface=$(first_iface)
+    ipv4=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4; exit}' || true)
+    gpu_pci=$(lspci -Dnn 2>/dev/null | grep -Ei 'VGA|3D' | grep -i '10de:' | head -n1 || true)
+    gpu_name=""; driver=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || true)
+        driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)
+    fi
+    cuda_status="UNAVAILABLE"
+    if /usr/sbin/nodeos-cuda-smoke --quiet >/dev/null 2>&1; then cuda_status="PASS"
+    elif [ -f /run/nodeos/cuda-smoke.json ]; then cuda_status="FAIL"; fi
+    state="DISCOVERED"; [ "$cuda_status" = "PASS" ] && state="READY"
+    {
+        printf '{\n'
+        printf '  "schema":"resonarch.nodeos.capability.v1",\n'
+        printf '  "node_id":"%s","state":"%s","kernel":"%s",\n' "$(json_escape "$NODE_ID")" "$state" "$(json_escape "$kernel")"
+        printf '  "cpu":{"model":"%s","logical_processors":%s},\n' "$(json_escape "$cpu_model")" "$cpu_logical"
+        printf '  "memory":{"total_kib":%s},\n' "$mem_kib"
+        printf '  "network":{"interface":"%s","ipv4":"%s","peer":"%s"},\n' "$(json_escape "$iface")" "$(json_escape "$ipv4")" "$(json_escape "${NODEOS_PEER_IPV4:-}")"
+        printf '  "accelerators":[{"vendor":"NVIDIA","profile":"GTX 1070 Ti / sm_61","pci":"%s","name":"%s","driver":"%s"}],\n' "$(json_escape "$gpu_pci")" "$(json_escape "$gpu_name")" "$(json_escape "$driver")"
+        printf '  "health":{"cuda_smoke":"%s"}\n' "$cuda_status"
+        printf '}\n'
+    } > "$tmp"
+    mv "$tmp" "$OUT"
+    if [ "$state" = "READY" ]; then : > /run/nodeos/ready; else rm -f /run/nodeos/ready; fi
+}
+
+case "${1:-run}" in
+  --once) collect_once; cat "$OUT" ;;
+  run) while :; do collect_once; sleep "$INTERVAL"; done ;;
+  *) echo "usage: nodeos-agent [run|--once]" >&2; exit 2 ;;
+esac
