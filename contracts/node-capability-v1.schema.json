@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://resonarch.example/contracts/node-capability-v1.schema.json",
+  "title": "resonArch NodeOS Capability",
+  "type": "object",
+  "required": ["schema", "node_id", "cpu", "memory", "network", "accelerators"],
+  "properties": {
+    "schema": { "const": "resonarch.nodeos.capability.v1" },
+    "node_id": { "type": "string", "minLength": 1 },
+    "cpu": { "type": "object" },
+    "memory": { "type": "object" },
+    "network": { "type": "object" },
+    "accelerators": { "type": "array" },
+    "runtime_contracts": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": true
+}
