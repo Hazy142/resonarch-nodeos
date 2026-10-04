@@ -10,6 +10,17 @@ required = [
     "buildroot/external.mk",
     "buildroot/configs/resonarch_haswell_gtx1070ti_defconfig",
     "buildroot/configs/resonarch_dell_g15_5530_defconfig",
+    "compute_one/__init__.py",
+    "compute_one/protocol.py",
+    "compute_one/worker.py",
+    "compute_one/gateway.py",
+    "compute_one/physical_probe.py",
+    "compute_one/cuda13_kernel_probe.py",
+    "docs/evidence/dell-ada-cuda-driver-memcpy.json",
+    "docs/evidence/dell-ada-cuda13-nvrtc-marker.json",
+    "contracts/compute-one-v1.schema.json",
+    "tests/test_compute_one.py",
+    "docs/COMPUTE-ONE-001.md",
     "buildroot/board/resonarch/dell-g15-5530/post-build.sh",
     "buildroot/board/resonarch/dell-g15-5530/rootfs-overlay/etc/nodeos/nodeos.conf",
     "buildroot/board/resonarch/dell-g15-5530/rootfs-overlay/etc/init.d/S55nodeos-ssh",
@@ -53,4 +64,4 @@ print("NODEOS-001 layout/contracts: PASS")
 # behind the same protected CI gate without requiring workflow-write scope.
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
-                "-p", "test_dell_*.py", "-v"], check=True)
+                "-p", "test_*.py", "-v"], check=True)

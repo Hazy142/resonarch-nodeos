@@ -1,0 +1,13 @@
+{
+  "compute_one_worker_integrated": false,
+  "cuda_driver_api_version": 13030,
+  "device_index": 0,
+  "gpu_kernel_executed": true,
+  "nvrtc_version": "13.2",
+  "ptx_sha256": "ba2795fc67546ad9a47b63838da297a726e44d994fffda5f6121cc32388d6177",
+  "readback_marker": "0x4e4f4445",
+  "schema": "resonarch.compute-one.physical-cuda13-kernel.v1",
+  "sm": "8.9",
+  "source_sha256": "bdb56f6de102a0376459125cb9223938de8277cf3820f53a7121876828f5610b",
+  "status": "CUDA13_SM89_KERNEL_PASS"
+}
