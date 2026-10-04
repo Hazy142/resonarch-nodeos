@@ -17,8 +17,9 @@ import time
 import uuid
 from collections.abc import Callable
 
-from .protocol import ProtocolError, canonical, encode_wire
-from .worker import PROFILES
+from .protocol import HEX64, ProtocolError, canonical, encode_wire
+from .worker import PROFILES, execute as cpu_oracle
+from .cuda13_worker import SOURCE as ADA_KERNEL_SOURCE, STATUS as ADA_STATUS
 
 
 class AdmissionError(PermissionError):
@@ -105,9 +106,18 @@ class Gateway:
         raise ProtocolError("no authorized implementation")
 
     def dispatch(self, workunit: dict, *, lease: dict, preferred: str,
-                 allow_fallback=False) -> dict:
+                 allow_fallback=False, mode="stub", nvrtc_path=None) -> dict:
         wire = encode_wire(workunit)
         profile = self.choose(workunit, preferred, allow_fallback)
+        if mode not in ("stub", "cuda13_ada"):
+            raise ProtocolError("unknown execution mode")
+        if mode == "stub" and nvrtc_path is not None:
+            raise ProtocolError("NVRTC cannot be passed into CPU-only mode")
+        if mode == "cuda13_ada":
+            if profile != "ada":
+                raise ProtocolError("real CUDA13 worker supports Ada only")
+            if not isinstance(nvrtc_path, str) or not os.path.isabs(nvrtc_path) or not Path(nvrtc_path).is_file():
+                raise ProtocolError("trusted administrator must provide installed NVRTC path")
         if self.verify_lease(lease, workunit, profile) is not True:
             raise AdmissionError("invalid or mismatched lease")
         replay_key = (workunit["tenant"], workunit["workunit_id"], workunit["epoch"],
@@ -116,9 +126,13 @@ class Gateway:
             raise AdmissionError("replay: workunit attempt already consumed")
         self._consumed.add(replay_key)  # Consume even on worker crash or timeout.
         root = Path(__file__).resolve().parents[1]
+        command = ([sys.executable, "-u", "-m", "compute_one.worker", "--profile", profile]
+                   if mode == "stub" else
+                   [sys.executable, "-u", "-m", "compute_one.cuda13_worker",
+                    "--real", "--nvrtc", nvrtc_path])
         try:
             proc = subprocess.run(
-                [sys.executable, "-u", "-m", "compute_one.worker", "--profile", profile],
+                command,
                 cwd=root, input=wire, capture_output=True, timeout=self.worker_timeout_s,
                 check=False,
             )
@@ -130,15 +144,36 @@ class Gateway:
             result = json.loads(proc.stdout.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise WorkerError("invalid worker output") from exc
+        if not isinstance(result, dict):
+            raise WorkerError("worker receipt is not an object")
         if proc.returncode != 0:
             raise WorkerError("worker rejected: " + str(result.get("reason", "unknown")))
-        if (result.get("status") != "SIMULATED_PASS"
-                or result.get("gpu_executed") is not False
-                or result.get("source_root") != workunit["state_root"]
-                or result.get("workunit_id") != workunit["workunit_id"]
-                or result.get("epoch") != workunit["epoch"]
-                or result.get("attempt") != workunit["attempt"]
-                or result.get("worker_profile") != profile):
+        common = (isinstance(result, dict)
+                  and result.get("source_root") == workunit["state_root"]
+                  and result.get("workunit_id") == workunit["workunit_id"]
+                  and result.get("epoch") == workunit["epoch"]
+                  and result.get("attempt") == workunit["attempt"]
+                  and result.get("worker_profile") == profile)
+        if mode == "stub":
+            valid = (common and result.get("status") == "SIMULATED_PASS"
+                     and result.get("gpu_executed") is False
+                     and result.get("cuda_loaded") is False)
+        else:
+            valid = (common and result.get("schema") == "resonarch.compute-one.cuda13-result.v1"
+                     and result.get("status") == ADA_STATUS
+                     and result.get("gpu_executed") is True
+                     and result.get("cuda_loaded") is True
+                     and result.get("sm") == "8.9"
+                     and isinstance(result.get("cuda_driver_api_version"), int)
+                     and result["cuda_driver_api_version"] >= 13000
+                     and isinstance(result.get("nvrtc_version"), str)
+                     and result["nvrtc_version"].startswith("13.")
+                     and result.get("kernel_source_sha256") == hashlib.sha256(ADA_KERNEL_SOURCE).hexdigest()
+                     and isinstance(result.get("ptx_sha256"), str)
+                     and HEX64.fullmatch(result["ptx_sha256"]) is not None
+                     and result.get("tenant") == workunit["tenant"]
+                     and result.get("op") == workunit["op"])
+        if not valid:
             raise WorkerError("worker receipt invalid")
         try:
             raw = base64.b64decode(result["output_b64"], validate=True)
@@ -146,6 +181,13 @@ class Gateway:
             raise WorkerError("result not decodable") from exc
         if hashlib.sha256(raw).hexdigest() != result.get("output_sha256"):
             raise WorkerError("worker output hash mismatch")
+        if mode == "cuda13_ada":
+            reference = cpu_oracle("ada", wire)
+            if (reference["output_sha256"] != result["output_sha256"]
+                    or base64.b64decode(reference["output_b64"]) != raw):
+                raise WorkerError("physical CUDA result fails independent CPU oracle")
+            result["local_cpu_oracle_pass"] = True
+            result["receipt_signed"] = False  # Not APE/mTLS attestation yet.
         return result
 
 

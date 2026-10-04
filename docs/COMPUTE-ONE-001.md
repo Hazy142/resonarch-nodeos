@@ -63,7 +63,7 @@ all outputs are bounded and hash checked.
 - GPU capability and driver/toolkit matrix is a per-deployment prerequisite.
   Runtime minor-version compatibility is not a guarantee for all new features.
 
-## Deliberately open O3/O4/O5
+## O3 now integrated on the owner's Dell (details below); O4/O5 remain open
 
 - Dell physical Ada CUDA13 receive/normalize and pinned driver/ABI validation.
 - Tesla T4 physical CUDA13 with matching GSP/kernel/userspace (authorized host).
@@ -86,3 +86,66 @@ The first gate allocates 4096 GPU bytes, copies via official CUDA Driver API in 
 These physical scripts are **opt-in and not run in CI**: GitHub Ubuntu runners do not have this personal laptop, matching GPU, matching NVRTC DLL or its trust identity. The separate CPU subprocess gateway continues to return only SIMULATED_PASS; the physical kernel is not yet invoked as a ONE workunit. No GPU overclock, firmware change, binary reverse engineering, USB flashing, driver installation or OS setting was performed.
 
 Next O3 is an authorized `compute_one.cuda13_worker` that reads verified ONE input, executes whitelisted real CUDA kernels and returns SHA-verified receipts with full physical hardware/build evidence; it must never accept arbitrary PTX from clients.
+
+## O3 implementation: real Ada Compute ONE worker (Dell lab)
+
+**O3 local physical integration PASS on Dell G15 / RTX4060 Laptop sm89 /
+Windows driver 610.88 / NVRTC 13.2.** The external ONE v1 API and small bounded
+JSON/F09-like tensor fixture are unchanged. Gateway.dispatch now additionally
+accepts mode=cuda13_ada with an absolute locally installed nvrtc_path. The
+Gateway checks its injected lease, binds the lease to the selected backend,
+consumes the attempt before launch, then invokes compute_one.cuda13_worker as
+a separate process. The physical receipt must match tenant/workunit/epoch/
+attempt, source-root, sm89, CUDA13 compiler, pinned kernel-source SHA256 and
+output hash. The parent independently compares output against its CPU oracle.
+
+The real worker compiles ONLY static auditable own CUDA C from the source file
+through official NVRTC APIs, allocates bounded GPU input/output buffers,
+copies the verified input into VRAM, launches an approved CUDA kernel, fences
+completion with cuCtxSynchronize, reads back and cleans up. Three real workunits
+passed on Dell: checksum32 (sequential GPU byte sum), xor_u8 (256-thread grid),
+and cuda13_only_reverse (byte-reversal DISPATCH MARKER; not a claim that CUDA12
+is incapable of reversing bytes). The third job explicitly routed from a
+preferred Pascal plan to a separately authorized Ada physical worker. Every
+GPU output agreed byte-for-byte with an independent CPU reference.
+
+Owner-authorized, one-shot physical lab test from repository root:
+
+    python -m compute_one.real_demo --real --nvrtc "D:\Program Files\bin\x64\nvrtc64_130_0.dll"
+
+Physical tests are intentionally excluded from generic Ubuntu CI. To execute
+the manual GPU regression gate on a compatible authorized Windows test host,
+set COMPUTE_ONE_REAL_NVRTC_DLL to the installed DLL before running:
+
+    python -m unittest discover -s tests -p test_compute_one_cuda13.py -v
+
+Unsigned local end-to-end observations are stored in
+docs/evidence/dell-ada-compute-one-o3.json. Source/PTX hashes and SHA256 of
+original and output buffers are recorded, but this is NOT enterprise hardware
+attestation or a signed, timestamped evidence chain.
+
+**Not implemented:** production APE-signed leases, mTLS, multi-host durable
+replay protection, PCI/GSP secure attestation, F09/F10 remote transport,
+physical T4/Pascal CUDA workers, real GGML model operators, token-performance
+claims, NodeOS Linux NVRTC loader or signed Dell USB Secure Boot image. The
+HMAC verifier is a local-development-only helper and subprocess separation
+is not a malicious-code sandbox. Arbitrary PTX supplied by users is forbidden.
+Native NVIDIA .ko research remains independently gated.
+
+### O3 physical boundary gate (1 MiB)
+
+The same administrator-approved Dell also passed a fourth physical gateway
+workunit with a full 1,048,576-byte u8 tensor shaped [16, 65536] (within the
+original per-dimension limit). The approved Ada CUDA13 XOR kernel executed
+across a 4096-block CUDA grid; complete GPU output agreed byte-for-byte with
+an independent CPU oracle. Reproducible opt-in lab command:
+
+    python -m compute_one.real_demo --real --large --nvrtc "D:\Program Files\bin\x64\nvrtc64_130_0.dll"
+
+Its separate unsigned local pilot report is
+`docs/evidence/dell-ada-compute-one-o3-1mib.json` with all four physical
+workunit roots, per-input sizes, kernel-source/PTX hashes and SHA256 outputs.
+The 1-MiB output SHA256 on the initial Dell run was
+`5e8e6a984ed51e93f0b6889bb88b5322a9a52a109e2aa9b8636b11dbd050648c`.
+No sustained bandwidth, TPS, low-latency inference or production safety
+conclusion follows from this short synthetic test.
