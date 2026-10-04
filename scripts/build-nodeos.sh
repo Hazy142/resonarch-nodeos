@@ -54,7 +54,15 @@ fi
 make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" "$DEFCONFIG"
 make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" olddefconfig
 
-if [[ "$CONFIG_ONLY" -eq 1 ]]; then echo "NODEOS-001 configuration: PASS"; exit 0; fi
+if [[ "$CONFIG_ONLY" -eq 1 ]]; then
+  echo "NODEOS-001 $PROFILE configuration: PASS"
+  # The existing protected CI workflow invokes the default profile.
+  # In CI, also validate the independent Dell defconfig without changing workflow permissions.
+  if [[ "$PROFILE" == "haswell-gtx1070ti" && "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    "$0" --configure-only --profile=dell-g15-5530
+  fi
+  exit 0
+fi
 
 JOBS="${JOBS:-$(nproc)}"
 make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" -j"$JOBS"
