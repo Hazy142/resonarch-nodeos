@@ -24,4 +24,8 @@ else
 fi
 
 grep -q '"status":"PASS"' "$OUT" || fail "cuda-probe-nonpass"
+[ -r /etc/nodeos/nodeos.conf ] && . /etc/nodeos/nodeos.conf
+if [ -n "${NODEOS_EXPECTED_CC:-}" ]; then
+    grep -Fq "\"compute_capability\":\"$NODEOS_EXPECTED_CC\"" "$OUT" || fail "cuda-capability-mismatch"
+fi
 [ "$QUIET" -eq 1 ] || cat "$OUT"

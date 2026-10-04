@@ -51,3 +51,9 @@ See `vendor/nvidia/README.md` and `docs/NODEOS-001-bringup.md`.
 - **NODEOS-004** — CPU == RTX 4060 == GTX 1070 Ti cross-generation gate.
 - **NODEOS-005** — llama.cpp/GGML remote consumer.
 - **NODEOS-006** — immutable 24/7 appliance, watchdog and recovery.
+
+## Dell G15 5530 USB/headless pilot (experimental)
+
+`--profile=dell-g15-5530` is an isolated Buildroot configuration for the RTX 4060 Laptop GPU (`sm_89`), wired DHCP with direct-LAN fallback, and a **key-only** SSH listener that remains closed unless an individual `NODEOS_SSH_PUBKEY` is supplied at build time. The existing GTX 1070 Ti profile remains the default. Detailed safety, firmware and step-by-step build/boot gates: [DELL-G15-USB-001](docs/DELL-G15-USB-001.md).
+
+**Not yet a flashable Dell release:** the current EFI image is unsigned and Secure Boot is enabled on the test laptop; no compatible `sm_89` Linux NVIDIA payload has been admitted. The read-only Windows USB check `tools/dell-usb-preflight.ps1` identifies disks but never flashes them or changes UEFI settings. A second, independent console is necessary while the Dell itself boots NodeOS.

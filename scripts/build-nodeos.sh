@@ -6,14 +6,27 @@ BR_VERSION="2026.08"
 BR_COMMIT="d5180309b1b66ef3b8eaccca70ad69be8e0729a1"
 CACHE="$ROOT/.cache"
 BR_DIR="$CACHE/buildroot-$BR_VERSION"
-OUT="$ROOT/out/haswell-gtx1070ti"
-ART="$ROOT/out/artifacts"
+PROFILE=haswell-gtx1070ti
 CONFIG_ONLY=0
-
-if [[ "${1:-}" == "--configure-only" ]]; then CONFIG_ONLY=1
-elif [[ -n "${1:-}" ]]; then echo "usage: $0 [--configure-only]" >&2; exit 2
+for arg in "$@"; do
+ case "$arg" in
+  --configure-only) CONFIG_ONLY=1 ;;
+  --profile=dell-g15-5530) PROFILE=dell-g15-5530 ;;
+  --profile=haswell-gtx1070ti) PROFILE=haswell-gtx1070ti ;;
+  *) echo "unknown option: $arg" >&2; exit 2 ;;
+ esac
+done
+OUT="$ROOT/out/$PROFILE"
+ART="$ROOT/out/artifacts/$PROFILE"
+if [ "$PROFILE" = "dell-g15-5530" ]; then
+ DEFCONFIG=resonarch_dell_g15_5530_defconfig
+ CAPABILITY=8.9
+ MANIFEST_PROFILE=dell-g15-5530-v1
+else
+ DEFCONFIG=resonarch_haswell_gtx1070ti_defconfig
+ CAPABILITY=6.1
+ MANIFEST_PROFILE=haswell-gtx1070ti-v1
 fi
-
 for cmd in git make gcc python3 rsync; do
   command -v "$cmd" >/dev/null || { echo "missing host command: $cmd" >&2; exit 1; }
 done
@@ -31,14 +44,14 @@ fi
 
 PAYLOAD="$ROOT/vendor/nvidia/payload"
 if [[ -f "$PAYLOAD/manifest.json" ]]; then
-  python3 "$ROOT/scripts/verify-nvidia-payload.py" "$PAYLOAD"
+  python3 "$ROOT/scripts/verify-nvidia-payload.py" "$PAYLOAD" "$CAPABILITY" "$MANIFEST_PROFILE"
   export NODEOS_NVIDIA_PAYLOAD="$PAYLOAD"
 else
   unset NODEOS_NVIDIA_PAYLOAD || true
   echo "NodeOS: no NVIDIA vendor payload; base image will boot but CUDA readiness fails closed."
 fi
 
-make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" resonarch_haswell_gtx1070ti_defconfig
+make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" "$DEFCONFIG"
 make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" olddefconfig
 
 if [[ "$CONFIG_ONLY" -eq 1 ]]; then echo "NODEOS-001 configuration: PASS"; exit 0; fi
@@ -52,5 +65,5 @@ for name in disk.img bzImage rootfs.ext2; do
   cp -f "$src" "$ART/$name"
 done
 
-python3 "$ROOT/scripts/hash-artifacts.py" "$ART" "$BR_VERSION" "$BR_COMMIT"
+python3 "$ROOT/scripts/hash-artifacts.py" "$ART" "$BR_VERSION" "$BR_COMMIT" "$MANIFEST_PROFILE"
 echo "NODEOS-001 build complete: $ART/disk.img"

@@ -4,6 +4,7 @@ CONF=/etc/nodeos/nodeos.conf
 [ -r "$CONF" ] && . "$CONF"
 NODE_ID=${NODEOS_NODE_ID:-haswell-gtx1070ti-01}
 INTERVAL=${NODEOS_AGENT_INTERVAL:-10}
+NODEOS_GPU_PROFILE="${NODEOS_GPU_PROFILE:-GTX 1070 Ti / sm_61}"
 OUT=/run/nodeos/capability.json
 mkdir -p /run/nodeos
 
@@ -45,7 +46,7 @@ collect_once() {
         printf '  "cpu":{"model":"%s","logical_processors":%s},\n' "$(json_escape "$cpu_model")" "$cpu_logical"
         printf '  "memory":{"total_kib":%s},\n' "$mem_kib"
         printf '  "network":{"interface":"%s","ipv4":"%s","peer":"%s"},\n' "$(json_escape "$iface")" "$(json_escape "$ipv4")" "$(json_escape "${NODEOS_PEER_IPV4:-}")"
-        printf '  "accelerators":[{"vendor":"NVIDIA","profile":"GTX 1070 Ti / sm_61","pci":"%s","name":"%s","driver":"%s"}],\n' "$(json_escape "$gpu_pci")" "$(json_escape "$gpu_name")" "$(json_escape "$driver")"
+        printf '  "accelerators":[{"vendor":"NVIDIA","profile":"%s","pci":"%s","name":"%s","driver":"%s"}],\n' "$(json_escape "$NODEOS_GPU_PROFILE")" "$(json_escape "$gpu_pci")" "$(json_escape "$gpu_name")" "$(json_escape "$driver")"
         printf '  "health":{"cuda_smoke":"%s"}\n' "$cuda_status"
         printf '}\n'
     } > "$tmp"

@@ -7,7 +7,8 @@ find_iface() {
     if [ -n "${NODEOS_INTERFACE:-}" ] && [ -d "/sys/class/net/$NODEOS_INTERFACE" ]; then
         printf '%s\n' "$NODEOS_INTERFACE"; return
     fi
-    for p in /sys/class/net/*; do
+    for p in /sys/class/net/en* /sys/class/net/eth* /sys/class/net/*; do
+        [ -d "$p" ] || continue
         n=$(basename "$p"); [ "$n" = lo ] && continue
         printf '%s\n' "$n"; return
     done
@@ -20,7 +21,14 @@ case "${1:-start}" in
     iface=$(find_iface) || { echo "NodeOS: no network interface found" >&2; exit 1; }
     ip link set dev "$iface" up
     if [ "${NODEOS_LINK_MODE:-static}" = "dhcp" ]; then
-        udhcpc -q -n -t 5 -i "$iface"
+        if ! udhcpc -q -n -t 5 -i "$iface"; then
+            if [ -n "${NODEOS_FALLBACK_IPV4_CIDR:-}" ]; then
+                ip addr flush dev "$iface"
+                ip addr add "$NODEOS_FALLBACK_IPV4_CIDR" dev "$iface"
+            else
+                echo "DHCP failed; no fallback" >&2; exit 1
+            fi
+        fi
     else
         ip addr flush dev "$iface"
         ip addr add "${NODEOS_IPV4_CIDR:-192.168.77.2/30}" dev "$iface"

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+case "$1" in
+ start)
+  KEY=/etc/nodeos/authorized_keys
+  [ -s "$KEY" ] || { echo "NodeOS SSH unprovisioned, fail closed"; exit 0; }
+  mkdir -p /root/.ssh /run/nodeos
+  chmod 700 /root/.ssh
+  cp "$KEY" /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+  /usr/sbin/dropbear -R -s -g -p 22 -P /run/nodeos/dropbear.pid
+  ;;
+ stop)
+  if [ -f /run/nodeos/dropbear.pid ]; then
+   kill "$(cat /run/nodeos/dropbear.pid)" 2>/dev/null || true
+   rm -f /run/nodeos/dropbear.pid
+  fi
+  ;;
+ restart) "$0" stop; "$0" start ;;
+ *) exit 2 ;;
+esac
