@@ -6,3 +6,6 @@ dl/
 *.iso
 *.log
 .env
+
+__pycache__/
+*.pyc

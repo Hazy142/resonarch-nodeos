@@ -1,0 +1,7 @@
+*.sh text eol=lf
+buildroot/**/etc/init.d/S* text eol=lf
+buildroot/package/nodeos-agent/src/nodeos-agent text eol=lf
+buildroot/**/usr/sbin/* text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.json text eol=lf

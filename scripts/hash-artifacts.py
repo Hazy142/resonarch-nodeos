@@ -4,7 +4,7 @@ import hashlib, json, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-if len(sys.argv) != 4:
+if len(sys.argv) not in (4, 5):
     raise SystemExit("usage: hash-artifacts.py ARTIFACT_DIR BUILDROOT_VERSION BUILDROOT_COMMIT")
 artifact_dir = Path(sys.argv[1]).resolve()
 artifacts = []
@@ -27,7 +27,7 @@ payload = {
     "nodeos_commit": repo_commit,
     "buildroot_version": sys.argv[2],
     "buildroot_commit": sys.argv[3],
-    "profile": "haswell-gtx1070ti-v1",
+    "profile": sys.argv[4] if len(sys.argv)==5 else "haswell-gtx1070ti-v1",
     "artifacts": artifacts,
 }
 out = artifact_dir / "nodeos-001-build.json"

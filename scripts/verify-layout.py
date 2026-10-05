@@ -9,6 +9,10 @@ required = [
     "buildroot/Config.in",
     "buildroot/external.mk",
     "buildroot/configs/resonarch_haswell_gtx1070ti_defconfig",
+    "buildroot/configs/resonarch_dell_g15_5530_defconfig",
+    "buildroot/board/resonarch/dell-g15-5530/post-build.sh",
+    "buildroot/board/resonarch/dell-g15-5530/rootfs-overlay/etc/nodeos/nodeos.conf",
+    "buildroot/board/resonarch/dell-g15-5530/rootfs-overlay/etc/init.d/S55nodeos-ssh",
     "buildroot/package/nodeos-agent/Config.in",
     "buildroot/package/nodeos-agent/nodeos-agent.mk",
     "buildroot/package/nodeos-agent/src/nodeos-agent",
@@ -36,6 +40,17 @@ for needle in (
     if needle not in defconfig:
         raise SystemExit(f"required defconfig invariant missing: {needle}")
 
+dell = (ROOT / "buildroot/configs/resonarch_dell_g15_5530_defconfig").read_text()
+for token in ("BR2_PACKAGE_DROPBEAR=y", "dell-g15-5530/rootfs-overlay",
+              "dell-g15-5530/post-build.sh", "BR2_TARGET_GRUB2_X86_64_EFI=y"):
+    if token not in dell:
+        raise SystemExit("missing Dell defconfig invariant: " + token)
 for path in (ROOT / "contracts").glob("*.json"):
     json.loads(path.read_text())
 print("NODEOS-001 layout/contracts: PASS")
+
+# Existing GitHub workflow already runs this script. Keep Dell unit tests
+# behind the same protected CI gate without requiring workflow-write scope.
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
+                "-p", "test_dell_*.py", "-v"], check=True)
