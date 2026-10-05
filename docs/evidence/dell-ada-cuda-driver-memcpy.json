@@ -1,0 +1,11 @@
+{
+  "cuda_driver_api_version": 13030,
+  "cuda_toolkit_compiled": false,
+  "device_index": 0,
+  "gpu_executed_kernel": false,
+  "schema": "resonarch.compute-one.cuda-driver-probe.v1",
+  "sha256": "d41d438c379110c7f7b2c561b1f04f26c1b4549110791f8e022f48974280c13e",
+  "sm": "8.9",
+  "status": "CUDA_DRIVER_MEMCPY_PASS",
+  "transferred_bytes": 4096
+}
