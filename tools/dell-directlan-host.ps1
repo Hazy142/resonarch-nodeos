@@ -227,7 +227,7 @@ if ($FetchEvidence) {
     New-Item -ItemType Directory -Path $runSubdir | Out-Null
 
     Write-Diag "Fetching remote bundle '$remoteBundle' into isolated directory '$runSubdir'..."
-    $scpArgs = $sshOpts + @("root@${TargetIp}:${remoteBundle}", "$runSubdir\")
+    $scpArgs = $sshOpts + @("root@${TargetIp}:${remoteBundle}", $runSubdir)
     & $ScpCmd $scpArgs > $scpOutPath 2> $scpErrPath
     $scpCode = $LASTEXITCODE
     if ($scpCode -ne 0) {
