@@ -25,6 +25,10 @@ import re
 import sys
 import tarfile
 import tempfile
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None
 from pathlib import Path
 
 REQUIRED = [
@@ -69,6 +73,22 @@ def safe_read_json(path: Path) -> tuple[dict | None, str | None]:
         return None, f"malformed JSON: {err}"
 
 
+def validate_schema(data: dict, schema_filename: str) -> str | None:
+    if not jsonschema:
+        return None  # Skip if jsonschema is not installed
+
+    schema_path = Path(__file__).parent.parent / "contracts" / schema_filename
+    if not schema_path.is_file():
+        return f"schema file not found: {schema_filename}"
+    
+    try:
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(instance=data, schema=schema)
+        return None
+    except Exception as e:
+        return f"schema validation failed: {e}"
+
+
 def is_valid_ipv4(val: str) -> bool:
     if not isinstance(val, str) or not val.strip():
         return False
@@ -87,6 +107,9 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
 
     if manifest.get("schema") != "resonarch.nodeos.evidence-manifest.v1":
         problems.append("unexpected manifest schema")
+    
+    err = validate_schema(manifest, "nodeos-evidence-manifest-v1.schema.json")
+    if err: problems.append(f"manifest.json {err}")
 
     verdict = manifest.get("verdict")
     state = manifest.get("state")
@@ -147,11 +170,19 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
 
     # Determine expected CC from CLI options or known local profile mapping
     target_cc = expected_cc
-    if not target_cc and expected_profile:
-        target_cc = KNOWN_PROFILES.get(expected_profile)
-    if not target_cc:
-        prof = manifest.get("profile") or ""
-        target_cc = KNOWN_PROFILES.get(prof)
+    prof = manifest.get("profile") or ""
+    
+    if expected_profile:
+        if expected_profile not in KNOWN_PROFILES:
+            problems.append(f"unknown expected profile: {expected_profile}")
+        else:
+            if not target_cc:
+                target_cc = KNOWN_PROFILES.get(expected_profile)
+        if prof != expected_profile:
+            problems.append(f"profile mismatch: manifest has {prof}, expected {expected_profile}")
+    else:
+        if not target_cc:
+            target_cc = KNOWN_PROFILES.get(prof)
 
     # Cross-file structural & semantic checks
     if (bundle / "gate-report.json").is_file():
@@ -159,6 +190,9 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
         if err or gr is None:
             problems.append(f"gate-report.json error: {err}")
         else:
+            err = validate_schema(gr, "nodeos-gate-report-v1.schema.json")
+            if err: problems.append(f"gate-report.json {err}")
+            
             if verdict == "PASS" and gr.get("verdict") != "PASS":
                 problems.append(f"semantic mismatch: gate-report verdict is {gr.get('verdict')}")
             if verdict == "PASS" and gr.get("state") != "NODE_READY":
@@ -170,6 +204,9 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
         if err or cap is None:
             problems.append(f"capability.json error: {err}")
         else:
+            err = validate_schema(cap, "node-capability-v1.schema.json")
+            if err: problems.append(f"capability.json {err}")
+
             cap_data = cap
             if verdict == "PASS":
                 if cap.get("verdict") != "PASS":
@@ -203,7 +240,7 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
                     if not is_valid_ipv4(str(ipv4)):
                         problems.append(f"semantic mismatch: capability network IPv4 invalid: {ipv4}")
             elif verdict == "PASS":
-                problems.append("semantic mismatch: capability network object missing")
+                problems.append("semantic mismatch: capability network object missing or invalid type")
 
     net_data = None
     if (bundle / "network.json").is_file():
@@ -250,7 +287,9 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
                 problems.append(f"CUDA CC inconsistency: capability ({cap_cc}) != cuda-smoke ({cuda_cc})")
 
     if target_cc and verdict == "PASS":
-        if cuda_cc and str(cuda_cc) != str(target_cc):
+        if not cuda_cc:
+            problems.append(f"compute capability missing, expected {target_cc}")
+        elif str(cuda_cc) != str(target_cc):
             problems.append(f"compute capability mismatch: measured {cuda_cc} != expected {target_cc}")
 
     if (bundle / "pcie.json").is_file():
@@ -259,13 +298,13 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
             problems.append(f"pcie.json error: {err}")
         else:
             src = pcie.get("source")
-            if src and src not in VALID_PCIE_SOURCES and src != "none":
+            if src is not None and src not in VALID_PCIE_SOURCES and src != "none":
                 problems.append(f"invalid pcie source: {src}")
             addr = pcie.get("address")
-            if addr and not PCI_RE.match(addr):
+            if addr and not PCI_RE.match(str(addr)):
                 problems.append(f"invalid PCI address format in pcie.json: {addr}")
             if verdict == "PASS":
-                if src == "none" or not addr:
+                if src == "none" or not src or not addr:
                     problems.append("semantic mismatch: pcie evidence has no GPU address or source is none")
 
     return not problems, problems, manifest
@@ -287,6 +326,9 @@ def main(argv: list[str]) -> int:
         if target.is_file():
             try:
                 with tarfile.open(target) as archive:
+                    for member in archive.getmembers():
+                        if member.name.startswith("/") or ".." in member.name:
+                            raise ValueError(f"unsafe tar member: {member.name}")
                     if sys.version_info >= (3, 12):
                         archive.extractall(tmp, filter="data")
                     else:

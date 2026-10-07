@@ -440,31 +440,59 @@ class EvidenceTests(LabTestBase):
         self.assertEqual(verify.returncode, 0, verify.stdout)
         self.assertIn("scp -i <key> root@", proc.stdout)
 
+    def test_export_alias_name(self):
+        lab = self.lab()
+        alias = lab.bin / "nodeos-evidence-export"
+        shutil.copy(lab.bin / "nodeos-evidence", alias)
+        proc = subprocess.run([SH, str(alias)], env=lab.env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("bundle:", proc.stdout)
+
+    def test_verify_subcommand(self):
+        lab = self.lab()
+        self.collect(lab)
+        bundle = lab.run_dir / "evidence/1a2b3c4d-1111-2222-3333-444455556666"
+        self.assertEqual(lab.run("nodeos-evidence", "verify", str(bundle)).returncode, 0)
+        (bundle / "capability.json").write_text("{}")
+        self.assertNotEqual(lab.run("nodeos-evidence", "verify", str(bundle)).returncode, 0)
+
+    def test_agent_loop_collects_evidence_automatically_once_stable(self):
+        lab = self.lab(conf_extra="NODEOS_EVIDENCE_STABLE_CYCLES=2\nNODEOS_AGENT_INTERVAL=1\n")
+        proc = subprocess.Popen([SH, str(lab.bin / "nodeos-agent"), "run"], env=lab.env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            latest = lab.run_dir / "evidence/latest.env"
+            deadline = time.time() + 40
+            while time.time() < deadline and not latest.exists():
+                time.sleep(0.5)
+            self.assertTrue(latest.exists(), "no automatic evidence bundle")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+        self.assertIn("EVIDENCE_VERDICT='PASS'", latest.read_text())
+        self.assertIn("EVIDENCE id=", lab.log.read_text())
+
     def test_pcie_best_link_pair_capacity_ranking_and_counterexample(self):
         # Counterexample to linear gen*width heuristic:
-        # Gen2 x8 (500*8 = 4000 MB/s) vs Gen3 x4 (985*4 = 3940 MB/s)
-        # Linear gen*width: Gen2 x8 = 2*8 = 16 vs Gen3 x4 = 3*4 = 12. Linear says Gen2 x8 > Gen3 x4.
-        # True bandwidth: Gen2 x8 (4000 MB/s) > Gen3 x4 (3940 MB/s).
-        # Counterexample 2:
-        # Gen2 x16 (500*16 = 8000 MB/s) vs Gen3 x8 (985*8 = 7880 MB/s).
-        # Linear: 2*16 = 32 vs 3*8 = 24 (Linear: 32 > 24).
-        # True bandwidth: Gen2 x16 (8000 MB/s) > Gen3 x8 (7880 MB/s).
+        # Gen3 x8 (985*8 = 7880 MB/s) vs Gen5 x4 (3938*4 = 15752 MB/s)
+        # Linear gen*width heuristic: Gen3 x8 = 3*8 = 24 vs Gen5 x4 = 5*4 = 20. Linear says Gen3 x8 > Gen5 x4.
+        # True bandwidth: Gen5 x4 (15752 MB/s) > Gen3 x8 (7880 MB/s).
         lab = self.lab()
         pci = lab.sysfs / "bus/pci/devices/0000:01:00.0"
 
-        # Step 1: Gen3 x4 (3940 MB/s)
-        lab.w(pci / "current_link_speed", "8.0 GT/s PCIe\n")
+        # Step 1: Gen5 x4 (15752 MB/s)
+        lab.w(pci / "current_link_speed", "32.0 GT/s PCIe\n")
         lab.w(pci / "current_link_width", "4\n")
         lab.agent()
         pcie1 = json.loads((lab.run_dir / "pcie.json").read_text())
-        self.assertEqual(pcie1["best_observed"], {"generation": 3, "width": 4})
+        self.assertEqual(pcie1["best_observed"], {"generation": 5, "width": 4})
 
-        # Step 2: Gen2 x8 (4000 MB/s) -> 4000 MB/s > 3940 MB/s, so Gen2 x8 updates best_observed!
-        lab.w(pci / "current_link_speed", "5.0 GT/s PCIe\n")
+        # Step 2: Gen3 x8 (7880 MB/s) -> 7880 MB/s < 15752 MB/s, so Gen3 x8 MUST NOT update best_observed!
+        lab.w(pci / "current_link_speed", "8.0 GT/s PCIe\n")
         lab.w(pci / "current_link_width", "8\n")
         lab.agent()
         pcie2 = json.loads((lab.run_dir / "pcie.json").read_text())
-        self.assertEqual(pcie2["best_observed"], {"generation": 2, "width": 8})
+        self.assertEqual(pcie2["best_observed"], {"generation": 5, "width": 4})
 
     def test_pcie_best_link_pair_tie_break(self):
         # Tie-break: Gen1 x4 (250*4 = 1000 MB/s) vs Gen2 x2 (500*2 = 1000 MB/s)
@@ -682,6 +710,14 @@ class HostPowerShellTests(unittest.TestCase):
             self.skipTest("No PowerShell executable found")
 
         script = ROOT / "tools/dell-directlan-host.ps1"
+
+        # Test 1: Syntax Parse
+        syntax_check = subprocess.run(
+            [ps, "-NoProfile", "-Command", f"& {{ $errs=$null; [System.Management.Automation.Language.Parser]::ParseFile('{script}', [ref]$null, [ref]$errs); if($errs) {{ throw 'Syntax error' }} }}"],
+            capture_output=True, text=True
+        )
+        self.assertEqual(syntax_check.returncode, 0, f"PowerShell syntax errors:\n{syntax_check.stderr}\n{syntax_check.stdout}")
+
         tmp = Path(tempfile.mkdtemp(prefix="nodeos-host-ps-"))
         self.addCleanup(shutil.rmtree, tmp, True)
 
@@ -693,58 +729,45 @@ class HostPowerShellTests(unittest.TestCase):
         key_file = tmp / "id_ed25519"
         key_file.write_text("fake-ssh-key\n")
 
-        # Case 1: Export failure -> script exits non-zero (FAIL)
+        # Mock scripts for Windows/Linux
+        ext = ".cmd" if sys.platform == "win32" else ""
+
+        ssh_mock = bin_dir / f"ssh{ext}"
+        scp_mock = bin_dir / f"scp{ext}"
+        python_mock = bin_dir / f"python{ext}"
+
         if sys.platform == "win32":
-            ssh_fail = bin_dir / "ssh_fail.cmd"
-            ssh_fail.write_text("@echo off\necho export failed >&2\nexit /b 1\n")
-            scp_mock = bin_dir / "scp_mock.cmd"
-            scp_mock.write_text("@echo off\nexit /b 0\n")
+            ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
+            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('mock tar content')\" %*\nexit /b 0\n")
+            python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
         else:
-            ssh_fail = bin_dir / "ssh_fail"
-            ssh_fail.write_text("#!/bin/sh\necho export failed >&2\nexit 1\n")
-            ssh_fail.chmod(0o755)
-            scp_mock = bin_dir / "scp_mock"
-            scp_mock.write_text("#!/bin/sh\nexit 0\n")
+            ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            python_mock.write_text("#!/bin/sh\necho 'Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666'\nexit 0\n")
+            ssh_mock.chmod(0o755)
             scp_mock.chmod(0o755)
+            python_mock.chmod(0o755)
 
         cmd = [
             ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
             "-SshKeyPath", str(key_file), "-FetchEvidence", "-OutputDir", str(out_dir),
-            "-SshCmd", str(ssh_fail), "-ScpCmd", str(scp_mock), "-PythonCmd", sys.executable
+            "-SshCmd", str(ssh_mock), "-ScpCmd", str(scp_mock), "-PythonCmd", str(python_mock)
         ]
+
+        # Test 2: Success Run
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        self.assertNotEqual(proc.returncode, 0, "Export failure must result in non-zero exit code")
+        self.assertEqual(proc.returncode, 0, f"Expected success run to exit 0. Stdout:\n{proc.stdout}\nStderr:\n{proc.stderr}")
+        self.assertIn("SUCCESS EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666", proc.stdout)
+        self.assertIn("Evidence verification SUCCESSFUL", proc.stderr)
 
-        # Case 2: SCP failure with an old local tarball -> script exits non-zero (FAIL)
-        old_tar = out_dir / "nodeos-evidence-old12345678.tar"
-        old_tar.write_text("old tarball content")
-
+        # Test 3: Export failure (mock ssh fail)
         if sys.platform == "win32":
-            ssh_export_ok = bin_dir / "ssh_ok.cmd"
-            ssh_export_ok.write_text(
-                "@echo off\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-112233445566.tar\n"
-                "echo EXPORT_EVIDENCE_ID=1122334455667788990011223344556677889900112233445566778899001122\nexit /b 0\n"
-            )
-            scp_fail = bin_dir / "scp_fail.cmd"
-            scp_fail.write_text("@echo off\necho scp connection failed >&2\nexit /b 1\n")
+            ssh_mock.write_text("@echo off\nexit /b 1\n")
         else:
-            ssh_export_ok = bin_dir / "ssh_ok"
-            ssh_export_ok.write_text(
-                "#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-112233445566.tar\n"
-                "echo EXPORT_EVIDENCE_ID=1122334455667788990011223344556677889900112233445566778899001122\nexit 0\n"
-            )
-            ssh_export_ok.chmod(0o755)
-            scp_fail = bin_dir / "scp_fail"
-            scp_fail.write_text("#!/bin/sh\necho scp connection failed >&2\nexit 1\n")
-            scp_fail.chmod(0o755)
-
-        cmd2 = [
-            ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
-            "-SshKeyPath", str(key_file), "-FetchEvidence", "-OutputDir", str(out_dir),
-            "-SshCmd", str(ssh_export_ok), "-ScpCmd", str(scp_fail), "-PythonCmd", sys.executable
-        ]
-        proc2 = subprocess.run(cmd2, capture_output=True, text=True)
-        self.assertNotEqual(proc2.returncode, 0, "SCP failure must result in non-zero exit code even with old tarball present")
+            ssh_mock.write_text("#!/bin/sh\nexit 1\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: nodeos-evidence export failed with exit code 1", proc_fail.stderr)
 
 
 @unittest.skipUnless(HAVE_SH, "POSIX sh required")

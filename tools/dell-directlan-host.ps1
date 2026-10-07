@@ -6,7 +6,7 @@ param(
     [int]$IperfPort = 5201,
     [string]$SshKeyPath = "$HOME\.ssh\id_ed25519",
     [string]$KnownHostsFile = "",
-    [string]$StrictHostKeyChecking = "accept-new",
+    [string]$StrictHostKeyChecking = "yes",
     [switch]$StartIperfServer,
     [switch]$FetchEvidence,
     [string]$ExpectedCc = "6.1",
@@ -17,11 +17,13 @@ param(
     [string]$PythonCmd = "python"
 )
 
+$runId = [guid]::NewGuid().ToString().Substring(0,8)
+
 $ErrorActionPreference = "Stop"
 
 function Write-Diag {
     param([string]$Message)
-    [Console]::Stderr.WriteLine("[DIAG] $Message")
+    [Console]::Error.WriteLine("[DIAG] $Message")
 }
 
 function Test-TcpListener {
@@ -29,9 +31,14 @@ function Test-TcpListener {
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $asyncResult = $client.BeginConnect($Address, $Port, $null, $null)
-        $success = $asyncResult.AsyncWaitHandle.WaitOne(500, $false)
-        if ($client.Connected) { $client.Close() }
-        return $success
+        $waitSuccess = $asyncResult.AsyncWaitHandle.WaitOne(500, $false)
+        if ($waitSuccess -and $client.Connected) {
+            $client.EndConnect($asyncResult)
+            $client.Close()
+            return $true
+        }
+        $client.Close()
+        return $false
     } catch {
         return $false
     }
@@ -82,13 +89,13 @@ if ($ping) {
 }
 
 # 2. iperf3 server listener check
-Write-Diag "[2/4] Checking local iperf3 listener on $HostIp:$IperfPort..."
+Write-Diag "[2/4] Checking local iperf3 listener on ${HostIp}:${IperfPort}..."
 $listenerActive = Test-TcpListener -Address $HostIp -Port $IperfPort
 if ($listenerActive) {
-    Write-Diag "iperf3 TCP listener active on $HostIp:$IperfPort."
+    Write-Diag "iperf3 TCP listener active on ${HostIp}:${IperfPort}."
 } else {
     if ($StartIperfServer) {
-        Write-Diag "Starting iperf3 server bound to $HostIp:$IperfPort..."
+        Write-Diag "Starting iperf3 server bound to ${HostIp}:${IperfPort}..."
         if (!(Get-Command "iperf3" -ErrorAction SilentlyContinue)) {
             Write-Diag "ERROR: 'iperf3' executable not found on host."
             exit 1
@@ -104,13 +111,13 @@ if ($listenerActive) {
             }
         }
         if ($ready) {
-            Write-Diag "iperf3 server started and listening on $HostIp:$IperfPort."
+            Write-Diag "iperf3 server started and listening on ${HostIp}:${IperfPort}."
         } else {
-            Write-Diag "ERROR: iperf3 server failed to bind/listen on $HostIp:$IperfPort within 5 seconds."
+            Write-Diag "ERROR: iperf3 server failed to bind/listen on ${HostIp}:${IperfPort} within 5 seconds."
             exit 1
         }
     } else {
-        Write-Diag "WARNING: No iperf3 listener active on $HostIp:$IperfPort."
+        Write-Diag "WARNING: No iperf3 listener active on ${HostIp}:${IperfPort}."
     }
 }
 
@@ -124,17 +131,16 @@ if ($KnownHostsFile) {
 Write-Diag "[3/4] Checking direct-LAN SSH reachability..."
 if (Test-Path $SshKeyPath) {
     $sshArgs = $sshOpts + @("root@$TargetIp", "nodeos-console", "--once")
-    $sshProcess = Start-Process -FilePath $SshCmd -ArgumentList $sshArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-ssh-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-ssh-err.tmp"
-    $sshProcess.WaitForExit()
-    $sshCode = $sshProcess.ExitCode
+    & $SshCmd $sshArgs > "$env:TEMP\nodeos-ssh-$runId-out.tmp" 2> "$env:TEMP\nodeos-ssh-$runId-err.tmp"
+    $sshCode = $LASTEXITCODE
     if ($sshCode -eq 0) {
         Write-Diag "SSH console probe succeeded."
-        $out = Get-Content "$env:TEMP\nodeos-ssh-out.tmp" -Raw -ErrorAction SilentlyContinue
+        $out = Get-Content "$env:TEMP\nodeos-ssh-$runId-out.tmp" -Raw -ErrorAction SilentlyContinue
         Write-Diag "--- NodeOS Target Console Frame ---"
         Write-Diag $out
     } else {
-        $err = Get-Content "$env:TEMP\nodeos-ssh-err.tmp" -Raw -ErrorAction SilentlyContinue
-        Write-Diag "ERROR: SSH console command failed with exit code $sshCode: $err"
+        $err = Get-Content "$env:TEMP\nodeos-ssh-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
+        Write-Diag "ERROR: SSH console command failed with exit code ${sshCode}: $err"
         if (!$FetchEvidence) {
             exit $sshCode
         }
@@ -147,66 +153,71 @@ if ($FetchEvidence) {
 
     # Run evidence export on target
     $exportArgs = $sshOpts + @("root@$TargetIp", "nodeos-evidence", "export")
-    $expProc = Start-Process -FilePath $SshCmd -ArgumentList $exportArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-export-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-export-err.tmp"
-    $expProc.WaitForExit()
-    $expCode = $expProc.ExitCode
-    $expOut = Get-Content "$env:TEMP\nodeos-export-out.tmp" -Raw -ErrorAction SilentlyContinue
-    $expErr = Get-Content "$env:TEMP\nodeos-export-err.tmp" -Raw -ErrorAction SilentlyContinue
+    & $SshCmd $exportArgs > "$env:TEMP\nodeos-export-$runId-out.tmp" 2> "$env:TEMP\nodeos-export-$runId-err.tmp"
+    $expCode = $LASTEXITCODE
+    $expOut = Get-Content "$env:TEMP\nodeos-export-$runId-out.tmp" -Raw -ErrorAction SilentlyContinue
+    $expErr = Get-Content "$env:TEMP\nodeos-export-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
 
     if ($expCode -ne 0) {
-        Write-Diag "ERROR: nodeos-evidence export failed with exit code $expCode: $expErr"
+        Write-Diag "ERROR: nodeos-evidence export failed with exit code ${expCode}: $expErr"
         exit $expCode
     }
 
     # Parse EXPORT_BUNDLE and EXPORT_EVIDENCE_ID
-    $remoteBundle = ""
-    $expectedEvId = ""
+    $remoteBundles = @()
+    $expectedEvIds = @()
     foreach ($line in ($expOut -split "`r?`n")) {
         if ($line -match "^EXPORT_BUNDLE=(.+)$") {
-            $remoteBundle = $matches[1].Trim()
+            $remoteBundles += $matches[1].Trim()
         }
         if ($line -match "^EXPORT_EVIDENCE_ID=(.+)$") {
-            $expectedEvId = $matches[1].Trim()
+            $expectedEvIds += $matches[1].Trim()
         }
     }
 
-    if (!$remoteBundle) {
+    if ($remoteBundles.Count -eq 0) {
         # Fallback parsing for bundle: <path>
         foreach ($line in ($expOut -split "`r?`n")) {
             if ($line -match "^bundle:\s*(.+)$") {
-                $remoteBundle = $matches[1].Trim()
+                $remoteBundles += $matches[1].Trim()
             }
         }
     }
 
-    if (!$remoteBundle) {
-        Write-Diag "ERROR: Could not parse remote export bundle path from export output: $expOut"
+    if ($remoteBundles.Count -ne 1) {
+        Write-Diag "ERROR: Expected exactly 1 remote export bundle path from export output, found $($remoteBundles.Count): $expOut"
         exit 1
     }
+    $remoteBundle = $remoteBundles[0]
+
+    if ($expectedEvIds.Count -gt 1) {
+        Write-Diag "ERROR: Found multiple EXPORT_EVIDENCE_ID entries. Refusing ambiguous export."
+        exit 1
+    }
+    $expectedEvId = if ($expectedEvIds.Count -eq 1) { $expectedEvIds[0] } else { "" }
 
     # Validate remote path to prevent shell injection / ambiguous downloads
     if ($remoteBundle -match "[;&|<>`$]") {
         Write-Diag "ERROR: Remote bundle path contains invalid characters: $remoteBundle"
         exit 1
     }
-    if ($remoteBundle !match "^/run/nodeos/nodeos-evidence-[a-f0-9]+\.tar$" -and $remoteBundle !match "^/var/lib/nodeos/evidence/.*\.tar$") {
+    if ($remoteBundle -notmatch "^/run/nodeos/nodeos-evidence-[a-f0-9]+\.tar$" -and $remoteBundle -notmatch "^/var/lib/nodeos/evidence/.*\.tar$") {
         Write-Diag "ERROR: Remote bundle path does not match expected pattern: $remoteBundle"
         exit 1
     }
 
     # Create brand-new, isolated local download subdirectory
     $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
-    $runSubdir = Join-Path $OutputDir "download-$timestamp"
-    New-Item -ItemType Directory -Path $runSubdir -Force | Out-Null
+    $runSubdir = Join-Path $OutputDir "download-$timestamp-$runId"
+    New-Item -ItemType Directory -Path $runSubdir | Out-Null
 
     Write-Diag "Fetching remote bundle '$remoteBundle' into isolated directory '$runSubdir'..."
     $scpArgs = $sshOpts + @("root@${TargetIp}:${remoteBundle}", "$runSubdir\")
-    $scpProc = Start-Process -FilePath $ScpCmd -ArgumentList $scpArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-scp-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-scp-err.tmp"
-    $scpProc.WaitForExit()
-    $scpCode = $scpProc.ExitCode
+    & $ScpCmd $scpArgs > "$env:TEMP\nodeos-scp-$runId-out.tmp" 2> "$env:TEMP\nodeos-scp-$runId-err.tmp"
+    $scpCode = $LASTEXITCODE
     if ($scpCode -ne 0) {
-        $scpErr = Get-Content "$env:TEMP\nodeos-scp-err.tmp" -Raw -ErrorAction SilentlyContinue
-        Write-Diag "ERROR: SCP transfer failed with exit code $scpCode: $scpErr"
+        $scpErr = Get-Content "$env:TEMP\nodeos-scp-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
+        Write-Diag "ERROR: SCP transfer failed with exit code ${scpCode}: $scpErr"
         exit $scpCode
     }
 
@@ -228,27 +239,37 @@ if ($FetchEvidence) {
     if ($ExpectedCc) { $pyArgs += @("--expected-cc", $ExpectedCc) }
     if ($ExpectedProfile) { $pyArgs += @("--expected-profile", $ExpectedProfile) }
 
-    $pyProc = Start-Process -FilePath $PythonCmd -ArgumentList $pyArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-verify-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-verify-err.tmp"
-    $pyProc.WaitForExit()
-    $pyCode = $pyProc.ExitCode
-    $pyOut = Get-Content "$env:TEMP\nodeos-verify-out.tmp" -Raw -ErrorAction SilentlyContinue
-    $pyErr = Get-Content "$env:TEMP\nodeos-verify-out.tmp" -Raw -ErrorAction SilentlyContinue
+    & $PythonCmd $pyArgs > "$env:TEMP\nodeos-verify-$runId-out.tmp" 2> "$env:TEMP\nodeos-verify-$runId-err.tmp"
+    $pyCode = $LASTEXITCODE
+    $pyOut = Get-Content "$env:TEMP\nodeos-verify-$runId-out.tmp" -Raw -ErrorAction SilentlyContinue
+    $pyErr = Get-Content "$env:TEMP\nodeos-verify-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
 
     Write-Diag $pyOut
     if ($pyCode -ne 0) {
-        Write-Diag "ERROR: Host verifier rejected evidence bundle with exit code $pyCode."
+        Write-Diag "ERROR: Host verifier rejected evidence bundle with exit code ${pyCode}."
         exit $pyCode
     }
 
-    # Extract verified Evidence ID from output and compare to expectedEvId if available
-    $verifiedEvId = ""
+    # Extract verified Evidence ID from output and bind strictly
+    $verifiedEvIds = @()
     foreach ($line in ($pyOut -split "`r?`n")) {
         if ($line -match "^Evidence ID:\s*([a-f0-9]{64})$") {
-            $verifiedEvId = $matches[1].Trim()
+            $verifiedEvIds += $matches[1].Trim()
         }
     }
 
-    if ($expectedEvId -and $verifiedEvId -and $expectedEvId -ne $verifiedEvId) {
+    if ($verifiedEvIds.Count -ne 1) {
+        Write-Diag "ERROR: Verifier output must contain exactly one Evidence ID, found $($verifiedEvIds.Count)."
+        exit 1
+    }
+    $verifiedEvId = $verifiedEvIds[0]
+
+    if (!$expectedEvId) {
+        Write-Diag "ERROR: Export output did not provide EXPORT_EVIDENCE_ID to bind against."
+        exit 1
+    }
+
+    if ($expectedEvId -ne $verifiedEvId) {
         Write-Diag "ERROR: Evidence ID mismatch: export claimed '$expectedEvId', verified bundle is '$verifiedEvId'."
         exit 1
     }
