@@ -641,7 +641,7 @@ class EvidenceTests(LabTestBase):
 class HostVerifyEvidenceTests(unittest.TestCase):
     def make_bundle(self, tmp: Path) -> Path:
         bundle = tmp / "evidence/1a2b3c4d-1111-2222-3333-444455556666"
-        bundle.mkdir(parents=True)
+        bundle.mkdir(parents=True, exist_ok=True)
         (bundle / "manifest.json").write_text(json.dumps({
             "schema": "resonarch.nodeos.evidence-manifest.v1",
             "node_id": "test-node", "boot_id": "1a2b3c4d",
@@ -735,8 +735,9 @@ class HostVerifyEvidenceTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         
         unsafe_tar = tmp / "unsafe.tar"
+        escape_target = tmp / "escaped.txt"
         with tarfile.open(unsafe_tar, "w") as tar:
-            info = tarfile.TarInfo("../manifest.json")
+            info = tarfile.TarInfo("../escaped.txt")
             info.size = 2
             tar.addfile(info, io.BytesIO(b"{}"))
             
@@ -744,6 +745,7 @@ class HostVerifyEvidenceTests(unittest.TestCase):
         proc = subprocess.run(verifier + [str(unsafe_tar)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("unsafe tar member path", proc.stdout)
+        self.assertFalse(escape_target.exists(), "Tarball extraction escaped its root directory!")
         
         dup_tar = tmp / "dup.tar"
         with tarfile.open(dup_tar, "w") as tar:
@@ -754,6 +756,54 @@ class HostVerifyEvidenceTests(unittest.TestCase):
         proc = subprocess.run(verifier + [str(dup_tar)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("duplicate member path", proc.stdout)
+
+    def test_verify_evidence_manifest_and_sha256sums_safety(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        verifier = [sys.executable, str(ROOT / "tools/verify-evidence.py")]
+
+        # Test 1: Absolute path in manifest.json
+        bundle = self.make_bundle(tmp)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        manifest["files"].append({"name": "/etc/passwd", "sha256": "fake", "bytes": 10})
+        (bundle / "manifest.json").write_text(json.dumps(manifest))
+        proc = subprocess.run(verifier + [str(bundle)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("absolute paths are not allowed", proc.stdout)
+        
+        # Test 2: Parent traversal in SHA256SUMS
+        bundle = self.make_bundle(tmp)
+        sums = bundle / "SHA256SUMS"
+        sums.write_text(sums.read_text() + "fakehash  ../outside.txt\n")
+        proc = subprocess.run(verifier + [str(bundle)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("parent traversal is not allowed", proc.stdout)
+
+        # Test 3: Duplicate entry in manifest.json
+        bundle = self.make_bundle(tmp)
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        manifest["files"].append(manifest["files"][0])
+        (bundle / "manifest.json").write_text(json.dumps(manifest))
+        proc = subprocess.run(verifier + [str(bundle)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("duplicate manifest entry", proc.stdout)
+
+        # Test 4: Symlink in bundle
+        bundle = self.make_bundle(tmp)
+        if sys.platform != "win32": # Symlinks on Windows require admin privileges, skip on Windows
+            (bundle / "symlink.txt").symlink_to("capability.json")
+            sums = bundle / "SHA256SUMS"
+            sums.write_text(sums.read_text() + "fakehash  symlink.txt\n")
+            proc = subprocess.run(verifier + [str(bundle)], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("symlinks are not allowed", proc.stdout)
+
+        # Test 5: Successful baseline on synthetic bundle
+        bundle = self.make_bundle(tmp)
+        proc = subprocess.run(verifier + [str(bundle)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"Expected baseline to pass, got: {proc.stdout}")
+        self.assertIn("Evidence ID:", proc.stdout)
+        self.assertIn("bundle integrity: OK", proc.stdout)
 
 
 @unittest.skipUnless(HAVE_SH, "POSIX sh required")
@@ -871,7 +921,8 @@ class HostPowerShellTests(unittest.TestCase):
         cmd = [
             ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
             "-SshKeyPath", str(key_file), "-FetchEvidence", "-OutputDir", str(out_dir),
-            "-SshCmd", str(ssh_mock), "-ScpCmd", str(scp_mock), "-PythonCmd", str(python_mock)
+            "-SshCmd", str(ssh_mock), "-ScpCmd", str(scp_mock), "-PythonCmd", str(python_mock),
+            "-SkipNetworkProbe"
         ]
 
         # Test 2: Success Run
@@ -880,25 +931,31 @@ class HostPowerShellTests(unittest.TestCase):
         self.assertIn("SUCCESS EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666", proc.stdout)
         self.assertIn("Evidence verification SUCCESSFUL", proc.stderr)
 
-        # Test 3: Export failure (mock ssh fail)
+        # Test 3: Export failure (mock ssh fail) -> no scp, no verifier
         if sys.platform == "win32":
             ssh_mock.write_text("@echo off\nexit /b 1\n")
+            scp_mock.write_text("@echo off\necho SCP_CALLED > scp_called.txt\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\nexit 1\n")
+            scp_mock.write_text("#!/bin/sh\necho SCP_CALLED > scp_called.txt\nexit 0\n")
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
         self.assertIn("ERROR: nodeos-evidence export failed", proc_fail.stderr)
+        self.assertFalse((Path.cwd() / "scp_called.txt").exists(), "SCP was incorrectly called after export failed")
 
-        # Test 4: SCP failure
+        # Test 4: SCP failure -> no verifier
         if sys.platform == "win32":
             ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
             scp_mock.write_text("@echo off\nexit /b 1\n")
+            python_mock.write_text("@echo off\necho PYTHON_CALLED > py_called.txt\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
             scp_mock.write_text("#!/bin/sh\nexit 1\n")
+            python_mock.write_text("#!/bin/sh\necho PYTHON_CALLED > py_called.txt\nexit 0\n")
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
         self.assertIn("ERROR: SCP transfer failed", proc_fail.stderr)
+        self.assertFalse((Path.cwd() / "py_called.txt").exists(), "Verifier was incorrectly called after SCP failed")
 
         # Test 5: Verifier returns non-zero exit code
         if sys.platform == "win32":
@@ -941,6 +998,32 @@ class HostPowerShellTests(unittest.TestCase):
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
         self.assertIn("ERROR: Downloaded evidence tarball is 0 bytes", proc_fail.stderr)
+
+        # Clean up markers
+        if (Path.cwd() / "scp_called.txt").exists(): (Path.cwd() / "scp_called.txt").unlink()
+        if (Path.cwd() / "py_called.txt").exists(): (Path.cwd() / "py_called.txt").unlink()
+
+        # Test 9: Duplicate Export ID
+        if sys.platform == "win32":
+            ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=111\\nEXPORT_EVIDENCE_ID=222')\"\nexit /b 0\n")
+        else:
+            ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=111\necho EXPORT_EVIDENCE_ID=222\nexit 0\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: Found multiple EXPORT_EVIDENCE_ID entries. Refusing ambiguous export.", proc_fail.stderr)
+
+        # Test 10: Duplicate Verifier ID
+        if sys.platform == "win32":
+            ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
+            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('mock tar content')\" %*\nexit /b 0\n")
+            python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666\\nEvidence ID: 2222333344445555666677778888999900001111222233334444555566667777')\"\nexit /b 0\n")
+        else:
+            ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            python_mock.write_text("#!/bin/sh\necho 'Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666\\nEvidence ID: 2222333344445555666677778888999900001111222233334444555566667777'\nexit 0\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: Verifier output must contain exactly one Evidence ID, found 2.", proc_fail.stderr)
 
 
 @unittest.skipUnless(HAVE_SH, "POSIX sh required")

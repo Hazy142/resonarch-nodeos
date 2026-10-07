@@ -66,6 +66,32 @@ def find_bundle_dir(root: Path) -> Path:
     return candidates[0]
 
 
+def resolve_bundle_path(bundle: Path, name: str) -> tuple[Path | None, str | None]:
+    if not isinstance(name, str):
+        return None, "filename must be a string"
+    if not name.strip():
+        return None, "filename cannot be empty"
+    if name.startswith("/") or name.startswith("\\"):
+        return None, f"absolute paths are not allowed: {name}"
+    if ".." in Path(name).parts:
+        return None, f"parent traversal is not allowed: {name}"
+        
+    path = bundle / name
+    
+    try:
+        bundle_res = bundle.resolve()
+        path_res = path.resolve()
+        if bundle_res not in path_res.parents:
+            return None, f"path escapes bundle directory: {name}"
+    except Exception as e:
+        return None, f"path resolution failed: {e}"
+        
+    if path.is_symlink():
+        return None, f"symlinks are not allowed: {name}"
+        
+    return path, None
+
+
 def safe_read_json(path: Path) -> tuple[dict | None, str | None]:
     if not path.is_file():
         return None, "file missing"
@@ -127,7 +153,8 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
             problems.append(f"PASS bundle has non-ready state: {state}")
 
     for name in REQUIRED:
-        if not (bundle / name).is_file():
+        path, err = resolve_bundle_path(bundle, name)
+        if err or not path.is_file():
             if verdict == "PASS" or name not in missing.split(","):
                 problems.append(f"required file missing: {name}")
 
@@ -139,13 +166,19 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
     listed = {}
     for entry in files_list:
         if isinstance(entry, dict) and "name" in entry and "sha256" in entry and "bytes" in entry:
-            listed[entry["name"]] = entry
+            name = entry["name"]
+            if name in listed:
+                problems.append(f"duplicate manifest entry: {name}")
+            else:
+                listed[name] = entry
         else:
             problems.append("invalid file entry format in manifest.json")
 
     for name, entry in listed.items():
-        path = bundle / name
-        if not path.is_file():
+        path, err = resolve_bundle_path(bundle, name)
+        if err:
+            problems.append(f"invalid path in manifest: {err}")
+        elif not path.is_file():
             problems.append(f"listed file missing: {name}")
         elif sha256(path) != entry["sha256"]:
             problems.append(f"manifest hash mismatch: {name}")
@@ -163,9 +196,13 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
             for line in sums.read_text().splitlines():
                 digest, _, name = line.partition("  ")
                 name = name.lstrip("*")
+                if name in seen:
+                    problems.append(f"duplicate SHA256SUMS entry: {name}")
                 seen.add(name)
-                path = bundle / name
-                if not path.is_file() or sha256(path) != digest:
+                path, err = resolve_bundle_path(bundle, name)
+                if err:
+                    problems.append(f"invalid path in SHA256SUMS: {err}")
+                elif not path.is_file() or sha256(path) != digest:
                     problems.append(f"SHA256SUMS mismatch: {name}")
             for name in sorted(on_disk | {"manifest.json"}):
                 if name not in seen:

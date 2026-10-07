@@ -14,7 +14,8 @@ param(
     [string]$OutputDir = ".\evidence-downloads",
     [string]$SshCmd = "ssh",
     [string]$ScpCmd = "scp",
-    [string]$PythonCmd = "python"
+    [string]$PythonCmd = "python",
+    [switch]$SkipNetworkProbe
 )
 
 $runId = [guid]::NewGuid().ToString().Substring(0,8)
@@ -79,46 +80,51 @@ if ($FetchEvidence -or $StartIperfServer) {
     }
 }
 
-# 1. ICMP Ping check
-Write-Diag "[1/4] Checking ICMP reachability to $TargetIp..."
-$ping = Test-Connection -ComputerName $TargetIp -Count 2 -Quiet -ErrorAction SilentlyContinue
-if ($ping) {
-    Write-Diag "ICMP reachability OK."
-} else {
-    Write-Diag "WARNING: Target $TargetIp is not responding to ICMP ping."
-}
-
-# 2. iperf3 server listener check
-Write-Diag "[2/4] Checking local iperf3 listener on ${HostIp}:${IperfPort}..."
-$listenerActive = Test-TcpListener -Address $HostIp -Port $IperfPort
-if ($listenerActive) {
-    Write-Diag "iperf3 TCP listener active on ${HostIp}:${IperfPort}."
-} else {
-    if ($StartIperfServer) {
-        Write-Diag "Starting iperf3 server bound to ${HostIp}:${IperfPort}..."
-        if (!(Get-Command "iperf3" -ErrorAction SilentlyContinue)) {
-            Write-Diag "ERROR: 'iperf3' executable not found on host."
-            exit 1
-        }
-        Start-Process -FilePath "iperf3" -ArgumentList "-s", "-B", $HostIp, "-p", $IperfPort -WindowStyle Hidden
-        # Poll for readiness up to 5 seconds
-        $ready = $false
-        for ($i = 0; $i -lt 10; $i++) {
-            Start-Sleep -Milliseconds 500
-            if (Test-TcpListener -Address $HostIp -Port $IperfPort) {
-                $ready = $true
-                break
-            }
-        }
-        if ($ready) {
-            Write-Diag "iperf3 server started and listening on ${HostIp}:${IperfPort}."
-        } else {
-            Write-Diag "ERROR: iperf3 server failed to bind/listen on ${HostIp}:${IperfPort} within 5 seconds."
-            exit 1
-        }
+if (-not $SkipNetworkProbe) {
+    # 1. ICMP Ping check
+    Write-Diag "[1/4] Checking ICMP reachability to $TargetIp..."
+    $ping = Test-Connection -ComputerName $TargetIp -Count 2 -Quiet -ErrorAction SilentlyContinue
+    if ($ping) {
+        Write-Diag "ICMP reachability OK."
     } else {
-        Write-Diag "WARNING: No iperf3 listener active on ${HostIp}:${IperfPort}."
+        Write-Diag "WARNING: Target $TargetIp is not responding to ICMP ping."
     }
+
+    # 2. iperf3 server listener check
+    Write-Diag "[2/4] Checking local iperf3 listener on ${HostIp}:${IperfPort}..."
+    $listenerActive = Test-TcpListener -Address $HostIp -Port $IperfPort
+    if ($listenerActive) {
+        Write-Diag "iperf3 TCP listener active on ${HostIp}:${IperfPort}."
+    } else {
+        if ($StartIperfServer) {
+            Write-Diag "Starting iperf3 server bound to ${HostIp}:${IperfPort}..."
+            if (!(Get-Command "iperf3" -ErrorAction SilentlyContinue)) {
+                Write-Diag "ERROR: 'iperf3' executable not found on host."
+                exit 1
+            }
+            Start-Process -FilePath "iperf3" -ArgumentList "-s", "-B", $HostIp, "-p", $IperfPort -WindowStyle Hidden
+            # Poll for readiness up to 5 seconds
+            $ready = $false
+            for ($i = 0; $i -lt 10; $i++) {
+                Start-Sleep -Milliseconds 500
+                if (Test-TcpListener -Address $HostIp -Port $IperfPort) {
+                    $ready = $true
+                    break
+                }
+            }
+            if ($ready) {
+                Write-Diag "iperf3 server started and listening on ${HostIp}:${IperfPort}."
+            } else {
+                Write-Diag "ERROR: iperf3 server failed to bind/listen on ${HostIp}:${IperfPort} within 5 seconds."
+                exit 1
+            }
+        } else {
+            Write-Diag "WARNING: No iperf3 listener active on ${HostIp}:${IperfPort}."
+        }
+    }
+} else {
+    Write-Diag "[1/4] Skipping ICMP ping check (-SkipNetworkProbe)."
+    Write-Diag "[2/4] Skipping iperf3 listener check (-SkipNetworkProbe)."
 }
 
 # Common SSH options array
