@@ -5,3 +5,5 @@ buildroot/**/usr/sbin/* text eol=lf
 *.py text eol=lf
 *.yml text eol=lf
 *.json text eol=lf
+buildroot/package/nodeos-agent/src/* text eol=lf
+buildroot/package/nodeos-agent/nodeos-agent.mk text eol=lf

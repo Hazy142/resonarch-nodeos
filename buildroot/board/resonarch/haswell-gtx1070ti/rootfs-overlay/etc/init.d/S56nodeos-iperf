@@ -1,0 +1,25 @@
+#!/bin/sh
+# iperf3 server on the fabric address so the workstation can also drive tests.
+set -eu
+CONF=/etc/nodeos/nodeos.conf
+if [ -r "$CONF" ]; then . "$CONF"; fi
+PIDFILE=/run/nodeos/iperf3.pid
+
+case "${1:-start}" in
+ start)
+    [ "${NODEOS_IPERF_SERVER:-0}" = 1 ] || exit 0
+    command -v iperf3 >/dev/null 2>&1 || exit 0
+    ADDR="${NODEOS_IPV4_CIDR:-192.168.77.2/30}"; ADDR="${ADDR%%/*}"
+    mkdir -p /run/nodeos
+    iperf3 -s -D -B "$ADDR" -I "$PIDFILE" --logfile /var/log/nodeos-iperf3.log ||
+        echo "NodeOS iperf3 server failed to start" >&2
+    ;;
+ stop)
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+    fi
+    ;;
+ restart) "$0" stop; "$0" start ;;
+ *) echo "usage: $0 {start|stop|restart}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,30 @@
+#!/bin/sh
+# Key-only Dropbear on the direct LAN. Fail closed: no key in the image, no SSH.
+set -eu
+CONF=/etc/nodeos/nodeos.conf
+if [ -r "$CONF" ]; then . "$CONF"; fi
+PIDFILE=/run/nodeos/dropbear.pid
+
+case "${1:-start}" in
+ start)
+    KEY=/etc/nodeos/authorized_keys
+    [ -s "$KEY" ] || { echo "NodeOS SSH unprovisioned, fail closed"; exit 0; }
+    mkdir -p /root/.ssh /run/nodeos
+    chmod 700 /root/.ssh
+    cp "$KEY" /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    ADDR=22
+    [ -z "${NODEOS_SSH_LISTEN:-}" ] || ADDR="${NODEOS_SSH_LISTEN}:22"
+    # -s/-g: no password logins at all; -j/-k: no TCP forwarding.
+    /usr/sbin/dropbear -R -s -g -j -k -p "$ADDR" -P "$PIDFILE" ||
+        echo "NodeOS SSH failed to bind $ADDR" >&2
+    ;;
+ stop)
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+    fi
+    ;;
+ restart) "$0" stop; "$0" start ;;
+ *) echo "usage: $0 {start|stop|restart}" >&2; exit 2 ;;
+esac

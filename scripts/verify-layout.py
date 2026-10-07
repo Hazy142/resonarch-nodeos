@@ -16,14 +16,23 @@ required = [
     "buildroot/package/nodeos-agent/Config.in",
     "buildroot/package/nodeos-agent/nodeos-agent.mk",
     "buildroot/package/nodeos-agent/src/nodeos-agent",
+    "buildroot/package/nodeos-agent/src/nodeos-lib.sh",
+    "buildroot/package/nodeos-agent/src/nodeos-netgate",
+    "buildroot/package/nodeos-agent/src/nodeos-evidence",
+    "buildroot/package/nodeos-agent/src/nodeos-console",
     "buildroot/board/resonarch/haswell-gtx1070ti/linux-nodeos.fragment",
     "buildroot/board/resonarch/haswell-gtx1070ti/post-build.sh",
     "buildroot/board/resonarch/haswell-gtx1070ti/rootfs-overlay/etc/nodeos/nodeos.conf",
     "buildroot/board/resonarch/haswell-gtx1070ti/rootfs-overlay/etc/init.d/S20nodeos-net",
+    "buildroot/board/resonarch/haswell-gtx1070ti/rootfs-overlay/etc/init.d/S55nodeos-ssh",
+    "buildroot/board/resonarch/haswell-gtx1070ti/rootfs-overlay/etc/init.d/S56nodeos-iperf",
     "buildroot/board/resonarch/haswell-gtx1070ti/rootfs-overlay/etc/init.d/S90nodeos-agent",
     "buildroot/board/resonarch/haswell-gtx1070ti/rootfs-overlay/usr/sbin/nodeos-cuda-smoke",
     "tools/cuda/nodeos_cuda_probe.cu",
-    "contracts/nodeos-001-evidence-v1.schema.json",
+    "tools/verify-evidence.py",
+    "contracts/node-capability-v1.schema.json",
+    "contracts/nodeos-gate-report-v1.schema.json",
+    "contracts/nodeos-evidence-manifest-v1.schema.json",
 ]
 missing = [item for item in required if not (ROOT / item).is_file()]
 if missing:
@@ -49,8 +58,7 @@ for path in (ROOT / "contracts").glob("*.json"):
     json.loads(path.read_text())
 print("NODEOS-001 layout/contracts: PASS")
 
-# Existing GitHub workflow already runs this script. Keep Dell unit tests
-# behind the same protected CI gate without requiring workflow-write scope.
+# Existing GitHub workflow already runs this script.
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "tests"),
-                "-p", "test_dell_*.py", "-v"], check=True)
+                "-p", "test_*.py", "-v"], check=True)

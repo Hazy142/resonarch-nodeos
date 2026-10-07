@@ -1,0 +1,216 @@
+#!/bin/sh
+# nodeos-console: local tty1 lab console (plain shell + ANSI, no ncurses).
+#
+#   nodeos-console            interactive full-screen console (init respawns it on tty1)
+#   nodeos-console --once     print one plain-text frame and exit (also usable over SSH)
+#
+# Keys: [R] rerun gates  [N] iperf3 test  [D] diagnostics  [E] export evidence
+#       [L] full log     [S] shell
+NODEOS_LIB=${NODEOS_LIB:-/usr/lib/nodeos/nodeos-lib.sh}
+. "$NODEOS_LIB"
+nodeos_load_conf
+TERM=${TERM:-linux}; export TERM
+
+MSG=""
+PLAIN=0
+[ "${1:-}" != --once ] || PLAIN=1
+ESC=$(printf '\033')
+
+or_na() { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf 'n/a'; fi; }
+
+mark() {
+    case "${1:-}" in
+        PASS) printf '[ OK ]' ;;
+        FAIL) printf '[FAIL]' ;;
+        SKIPPED) printf '[SKIP]' ;;
+        WARN) printf '[WARN]' ;;
+        *) printf '[ -- ]' ;;
+    esac
+}
+
+fmt_uptime() {
+    _s=${1:-0}; case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+    printf '%02d:%02d:%02d' $((_s / 3600)) $((_s % 3600 / 60)) $((_s % 60))
+}
+
+row1() { printf '| %-76.76s |\n' "$1"; }
+row2() { printf '| %-36.36s | %-37.37s |\n' "$1" "$2"; }
+dashes() { printf '%*s' "$1" '' | tr ' ' '-'; }
+rule1() { printf '+%s+\n' "$(dashes 78)"; }
+rule2() { printf '+%s+%s+\n' "$(dashes 38)" "$(dashes 39)"; }
+title() {
+    _l=$(printf '+-- %s ' "$1")
+    printf '%s%s+\n' "$_l" "$(dashes $((79 - ${#_l})))"
+}
+
+load_status() {
+    STATUS_OK=0
+    if [ -r "$NODEOS_RUN/status.env" ]; then
+        . "$NODEOS_RUN/status.env"; STATUS_OK=1
+    fi
+    if [ -r "$NODEOS_RUN/network.env" ]; then . "$NODEOS_RUN/network.env"; fi
+    return 0
+}
+
+render() {
+    load_status
+    if [ "$STATUS_OK" != 1 ]; then
+        title "resonArch NodeOS / NODEOS-001-LAB"
+        row1 "waiting for nodeos-agent (no $NODEOS_RUN/status.env yet)"
+        rule1
+        return 0
+    fi
+    _ram=$(awk -v k="${MEM_KIB:-0}" 'BEGIN{printf "%.1f GiB", k/1048576}')
+    _gname=${GPU_NAME:-$GPU_LSPCI_NAME}
+    _commit=$(printf '%s' "${NODEOS_BUILD_COMMIT:-unknown}" | cut -c1-7)
+    _boot=$(printf '%s' "${BOOT_ID:-}" | cut -c1-8)
+    _pcie="n/a"
+    if [ -n "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ]; then
+        _pcie="Gen${PCIE_CUR_GEN:-?} x${PCIE_CUR_WIDTH:-?} (max Gen${PCIE_MAX_GEN:-?} x${PCIE_MAX_WIDTH:-?})"
+    fi
+    _nr=WARN; [ "$STATE" != NODE_READY ] || _nr=PASS
+    case "$STATE" in BLOCKED_*|BOOTING) _nr=FAIL ;; esac
+
+    title "resonArch NodeOS / NODEOS-001-LAB"
+    row1 "node: $NODE_ID    uptime: $(fmt_uptime "$UPTIME_S")"
+    row1 "build: $_commit  profile: ${NODEOS_BUILD_PROFILE:-unknown}  boot: $_boot"
+    rule2
+    row2 "SYSTEM STATE" "HARDWARE"
+    row2 "$(mark "$GATE_uefi") UEFI_BOOT" "CPU   $(or_na "$CPU_MODEL")"
+    row2 "$(mark "$GATE_kernel") KERNEL_READY" "RAM   $_ram  ${CPU_LOGICAL:-?} threads"
+    row2 "$(mark "$GATE_nic") NIC_DISCOVERED" "GPU   $(or_na "$_gname")"
+    row2 "$(mark "$GATE_link") LINK_READY" "VRAM  $(or_na "$GPU_MEM_USED") / $(or_na "$GPU_MEM_TOTAL") MiB"
+    row2 "$(mark "$GATE_gpu") GPU_DISCOVERED" "Temp  $(or_na "$GPU_TEMP") C   Util $(or_na "$GPU_UTIL") %"
+    row2 "$(mark "$GATE_payload") NVIDIA_PAYLOAD_VERIFIED" "Power $(or_na "$GPU_POWER") W / $(or_na "$GPU_POWER_LIMIT") W"
+    row2 "$(mark "$GATE_driver") DRIVER_READY" "Clock sm $(or_na "$GPU_CLK_SM")  mem $(or_na "$GPU_CLK_MEM") MHz"
+    row2 "$(mark "$GATE_cuda") CUDA_PROBE_PASS" "PCIe  $_pcie"
+    row2 "$(mark "$_nr") NODE_READY" "PCIe  best seen Gen$(or_na "$PCIE_BEST_GEN") x$(or_na "$PCIE_BEST_WIDTH")"
+    row2 "STATE $STATE" "Drv   $(or_na "$DRIVER")"
+    row2 "${STATE_REASON:+reason: $STATE_REASON}" "CUDA  $(or_na "$GATE_cuda_DETAIL")"
+    row2 "VERDICT $VERDICT" "Payload $(or_na "$GATE_payload_DETAIL")"
+    rule2
+    row2 "FABRIC LINK" "GATES"
+    row2 "$(or_na "$NET_IFACE") ${NET_DRIVER:+($NET_DRIVER)} carrier=$(or_na "$NET_CARRIER")" "CUDA smoke        $(or_na "$GATE_cuda")"
+    row2 "$(or_na "$NET_IPV4")" "peer reachable    $(or_na "$NG_PING_RESULT")"
+    row2 "$(or_na "$NET_SPEED") Mbit/s $(or_na "$NET_DUPLEX") duplex" "RTT               $(or_na "$NG_RTT") ms"
+    row2 "MTU $(or_na "$NET_MTU")   peer ${NODEOS_PEER_IPV4:-none}" "throughput        $(or_na "$NG_IPERF_MBIT") Mbit/s"
+    row2 "rx $(or_na "$NET_RX_BYTES") B  tx $(or_na "$NET_TX_BYTES") B" "packet loss       $(or_na "$NG_LOSS") %"
+    row2 "errors rx $(or_na "$NET_RX_ERRORS") tx $(or_na "$NET_TX_ERRORS")" "link errors       $(or_na "$NG_ERRORS")"
+    row2 "drops  rx $(or_na "$NET_RX_DROPPED") tx $(or_na "$NET_TX_DROPPED")" "network gate      $(or_na "$NG_STATUS") ${NG_REASON:+($NG_REASON)}"
+    rule1
+    row1 "LIVE LOG"
+    _rows=$(stty size 2>/dev/null | cut -d' ' -f1)
+    case "$_rows" in ''|*[!0-9]*) _rows=25 ;; esac
+    _n=$((_rows - 32)); [ "$_n" -ge 3 ] || _n=3; [ "$_n" -le 14 ] || _n=14
+    if [ -r "$NODEOS_LOG" ]; then
+        tail -n "$_n" "$NODEOS_LOG" | while IFS= read -r _line; do row1 "$_line"; done
+    fi
+    rule1
+    _ev="evidence: none yet"
+    if [ -r "$NODEOS_RUN/evidence/latest.env" ]; then
+        ( . "$NODEOS_RUN/evidence/latest.env"; printf 'evidence: %s %s' "$(printf '%s' "$EVIDENCE_ID" | cut -c1-16)" "$EVIDENCE_VERDICT" ) >"$NODEOS_RUN/.console.ev" 2>/dev/null &&
+            _ev=$(cat "$NODEOS_RUN/.console.ev")
+    fi
+    row1 "${MSG:-$_ev}"
+    row1 "[R] rerun gates [N] iperf [D] diagnostics [E] export evidence [L] log [S] shell"
+}
+
+colorize() {
+    sed -e "s/\[ OK \]/${ESC}[32m[ OK ]${ESC}[0m/g" \
+        -e "s/PASS/${ESC}[32mPASS${ESC}[0m/g" \
+        -e "s/FAIL/${ESC}[31;1mFAIL${ESC}[0m/g" \
+        -e "s/BLOCKED_[A-Z_]*/${ESC}[31;1m&${ESC}[0m/g" \
+        -e "s/DEGRADED_LINK/${ESC}[33;1m&${ESC}[0m/g" \
+        -e "s/\[WARN\]/${ESC}[33m[WARN]${ESC}[0m/g" \
+        -e "s/\[SKIP\]/${ESC}[33m[SKIP]${ESC}[0m/g" \
+        -e "s/\[ -- \]/${ESC}[90m[ -- ]${ESC}[0m/g"
+}
+
+draw() {
+    printf '%s[H' "$ESC"
+    render | colorize | sed "s/\$/${ESC}[K/"
+    printf '%s[J' "$ESC"
+}
+
+raw_mode() { stty -icanon -echo min 0 time 20 2>/dev/null || true; }
+cooked_mode() { stty sane 2>/dev/null || true; }
+read_key() { raw_mode; dd bs=1 count=1 2>/dev/null || true; }
+pause_key() {
+    printf '\n-- press any key --'
+    stty -icanon -echo min 1 time 0 2>/dev/null || true
+    dd bs=1 count=1 >/dev/null 2>&1 || true
+}
+screen_clear() { printf '%s[2J%s[H' "$ESC" "$ESC"; }
+
+act_rerun() {
+    MSG="rerunning gates (CUDA, network)..."; draw
+    rm -f "$NODEOS_RUN/.payload-gate" "$NODEOS_RUN/cuda-smoke.json"
+    "$NODEOS_BIN/nodeos-netgate" --ping >/dev/null 2>&1 || true
+    "$NODEOS_BIN/nodeos-agent" --once >/dev/null 2>&1 || true
+    MSG="gates rerun complete"
+}
+
+act_iperf() {
+    MSG="running iperf3 against the peer (about 10 s)..."; draw
+    "$NODEOS_BIN/nodeos-netgate" --full >/dev/null 2>&1 || true
+    "$NODEOS_BIN/nodeos-agent" --once >/dev/null 2>&1 || true
+    MSG="network gate: ${NG_STATUS:-?}  throughput ${NG_IPERF_MBIT:-n/a} Mbit/s"
+    load_status; MSG="network gate: ${NG_STATUS:-?}  iperf3 ${NG_IPERF_RESULT:-n/a} ${NG_IPERF_MBIT:-} Mbit/s"
+}
+
+act_diag() {
+    screen_clear; load_status
+    echo "NodeOS diagnostics  state=$STATE ${STATE_REASON:+reason=$STATE_REASON}  verdict=$VERDICT"
+    echo
+    for _g in $NODEOS_ALL_GATES; do
+        eval "_st=\${GATE_$_g:-}; _rs=\${GATE_${_g}_REASON:-}; _dt=\${GATE_${_g}_DETAIL:-}"
+        printf '%-8s %-8s %s\n' "$_g" "$_st" "${_rs:-$_dt}"
+        if [ "$_st" = FAIL ] && [ -n "$_rs" ]; then
+            _h=$(nodeos_hint "$_rs"); [ -z "$_h" ] || printf '         -> %s\n' "$_h"
+        fi
+    done
+    echo; echo "kernel messages (nvidia / pcie / link):"
+    dmesg 2>/dev/null | grep -iE 'nvrm|nvidia|xid|pcie|aer|link (is )?(up|down)|r8169|e1000|igb|igc' | tail -n 12
+    pause_key
+}
+
+act_evidence() {
+    screen_clear; echo "collecting evidence bundle..."
+    "$NODEOS_BIN/nodeos-evidence" collect --refresh || echo "evidence collection failed"
+    pause_key
+}
+
+act_log() {
+    cooked_mode; screen_clear
+    if command -v less >/dev/null 2>&1; then less +G "$NODEOS_LOG"
+    else tail -n 200 "$NODEOS_LOG" | more; fi
+}
+
+act_shell() {
+    cooked_mode; screen_clear
+    printf '%s[?25h' "$ESC"
+    echo "NodeOS shell - 'exit' returns to the lab console"
+    /bin/sh -l || true
+    printf '%s[?25l' "$ESC"
+}
+
+if [ "$PLAIN" = 1 ]; then
+    render
+    exit 0
+fi
+
+printf '%s[?25l' "$ESC"
+screen_clear
+while :; do
+    draw
+    key=$(read_key)
+    case "$key" in
+        r|R) act_rerun ;;
+        n|N) act_iperf ;;
+        d|D) act_diag; screen_clear ;;
+        e|E) act_evidence; screen_clear ;;
+        l|L) act_log; screen_clear ;;
+        s|S) act_shell; screen_clear ;;
+        *) [ -z "$key" ] || MSG="" ;;
+    esac
+done
