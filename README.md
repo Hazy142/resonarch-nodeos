@@ -31,6 +31,11 @@ Fast configuration gate:
 
 Artifacts are emitted to `out/artifacts/` with SHA-256 build evidence.
 
+### Host Prerequisites for Evidence Verification
+The `verify-evidence.py` script runs on the workstation and requires:
+- **Python 3.12+** (required for `tarfile.extractall(filter="data")` extraction safety)
+- **jsonschema** (required for strict structural validation: `pip install jsonschema`)
+
 ## CUDA boundary
 
 The public repo does not redistribute NVIDIA proprietary binaries. The base image boots without them but remains fail-closed in `DISCOVERED` state. A verified vendor payload plus a successful physical `sm_61` CUDA probe transitions the node to `READY`.

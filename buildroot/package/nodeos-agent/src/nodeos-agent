@@ -1,61 +1,455 @@
 #!/bin/sh
+# nodeos-agent: inventory, telemetry, gates and the NodeOS state machine.
+#
+#   nodeos-agent run     loop forever (init service)
+#   nodeos-agent --once  one collection pass, prints capability.json
+#
+# Outputs under $NODEOS_RUN (/run/nodeos):
+#   capability.json  gate-report.json  pcie.json  status.env  state  ready
 set -eu
-CONF=/etc/nodeos/nodeos.conf
-[ -r "$CONF" ] && . "$CONF"
+NODEOS_LIB=${NODEOS_LIB:-/usr/lib/nodeos/nodeos-lib.sh}
+. "$NODEOS_LIB"
+nodeos_load_conf
 NODE_ID=${NODEOS_NODE_ID:-haswell-gtx1070ti-01}
 INTERVAL=${NODEOS_AGENT_INTERVAL:-10}
 NODEOS_GPU_PROFILE="${NODEOS_GPU_PROFILE:-GTX 1070 Ti / sm_61}"
-OUT=/run/nodeos/capability.json
-mkdir -p /run/nodeos
+OUT=$NODEOS_RUN/capability.json
+mkdir -p "$NODEOS_RUN"
 
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]/ /g'; }
+CYCLE=0
+STABLE=0
+LAST_SIG=""
 
-first_iface() {
-    if [ -n "${NODEOS_INTERFACE:-}" ] && [ -d "/sys/class/net/$NODEOS_INTERFACE" ]; then
-        printf '%s\n' "$NODEOS_INTERFACE"; return
-    fi
-    for p in /sys/class/net/*; do
-        n=$(basename "$p"); [ "$n" = "lo" ] && continue
-        printf '%s\n' "$n"; return
-    done
-    printf '%s\n' "unknown"
+set_gate() { # name status reason detail
+    eval "GATE_$1=\$2; GATE_$1_REASON=\$3; GATE_$1_DETAIL=\$4"
+}
+# gv NAME SUFFIX -> value of GATE_NAME<SUFFIX> (suffix: empty, _REASON, _DETAIL)
+gv() { eval "printf '%s' \"\${GATE_$1${2:-}:-}\""; }
+
+pcie_gen() {
+    case "${1%% *}" in
+        2.5) echo 1 ;; 5|5.0) echo 2 ;; 8|8.0) echo 3 ;;
+        16|16.0) echo 4 ;; 32|32.0) echo 5 ;; 64|64.0) echo 6 ;;
+        *) echo "" ;;
+    esac
 }
 
-collect_once() {
-    tmp="$OUT.tmp"
-    cpu_model=$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
-    cpu_logical=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 0)
-    mem_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    kernel=$(uname -r)
-    iface=$(first_iface)
-    ipv4=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4; exit}' || true)
-    gpu_pci=$(lspci -Dnn 2>/dev/null | grep -Ei 'VGA|3D' | grep -i '10de:' | head -n1 || true)
-    gpu_name=""; driver=""
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 || true)
-        driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)
+num_or_empty() { case "$1" in ''|*[!0-9]*) echo "" ;; *) echo "$1" ;; esac; }
+max_num() { # a b -> larger numeric (empty-safe)
+    if [ -z "$1" ]; then echo "$2"; elif [ -z "$2" ]; then echo "$1"
+    elif [ "$1" -ge "$2" ]; then echo "$1"; else echo "$2"; fi
+}
+
+gpu_discover() {
+    GPU_PCI_LINE=$(lspci -Dnn 2>/dev/null | grep -Ei 'VGA|3D' | grep -i '10de:' | head -n1 || true)
+    GPU_ADDR=""; GPU_LSPCI_NAME=""
+    if [ -n "$GPU_PCI_LINE" ]; then
+        GPU_ADDR=${GPU_PCI_LINE%% *}
+        _n=$(printf '%s' "$GPU_PCI_LINE" | sed -n 's/.*\[\([^]]*\)\] \[10de:[0-9a-fA-F]*\].*/\1/p')
+        GPU_LSPCI_NAME=$_n
     fi
-    cuda_status="UNAVAILABLE"
-    if /usr/sbin/nodeos-cuda-smoke --quiet >/dev/null 2>&1; then cuda_status="PASS"
-    elif [ -f /run/nodeos/cuda-smoke.json ]; then cuda_status="FAIL"; fi
-    state="DISCOVERED"; [ "$cuda_status" = "PASS" ] && state="READY"
+}
+
+gpu_query() {
+    GPU_NAME=""; GPU_UUID=""; DRIVER=""; GPU_MEM_TOTAL=""; GPU_MEM_FREE=""; GPU_MEM_USED=""
+    GPU_TEMP=""; GPU_CLK_SM=""; GPU_CLK_MEM=""; GPU_UTIL=""; GPU_POWER=""; GPU_POWER_LIMIT=""
+    SMI_GEN_CUR=""; SMI_GEN_MAX=""; SMI_W_CUR=""; SMI_W_MAX=""
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    _line=$(nvidia-smi --query-gpu=name,uuid,driver_version,memory.total,memory.free,memory.used,temperature.gpu,clocks.sm,clocks.mem,utilization.gpu,power.draw,power.limit,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)
+    [ -n "$_line" ] || return 0
+    _line=$(printf '%s' "$_line" | sed 's/ *, */,/g')
+    _oifs=$IFS; IFS=,; set -f
+    # shellcheck disable=SC2086
+    set -- $_line
+    IFS=$_oifs; set +f
+    GPU_NAME=${1:-}; GPU_UUID=${2:-}; DRIVER=${3:-}
+    GPU_MEM_TOTAL=${4:-}; GPU_MEM_FREE=${5:-}; GPU_MEM_USED=${6:-}
+    GPU_TEMP=${7:-}; GPU_CLK_SM=${8:-}; GPU_CLK_MEM=${9:-}; GPU_UTIL=${10:-}
+    GPU_POWER=${11:-}; GPU_POWER_LIMIT=${12:-}
+    SMI_GEN_CUR=${13:-}; SMI_GEN_MAX=${14:-}; SMI_W_CUR=${15:-}; SMI_W_MAX=${16:-}
+    return 0
+}
+
+# Theoretical usable link bandwidth per lane in MB/s (accounting for encoding overhead):
+#   Gen 1 (2.5 GT/s,  8b/10b) = 250 MB/s per lane
+#   Gen 2 (5.0 GT/s,  8b/10b) = 500 MB/s per lane
+#   Gen 3 (8.0 GT/s, 128b/130b) = 985 MB/s per lane
+#   Gen 4 (16.0 GT/s, 128b/130b) = 1969 MB/s per lane
+#   Gen 5 (32.0 GT/s, 128b/130b) = 3938 MB/s per lane
+#   Gen 6 (64.0 GT/s, 242B/256B) = 7680 MB/s per lane
+pcie_lane_mbps() {
+    case "${1:-}" in
+        1) echo 250 ;; 2) echo 500 ;; 3) echo 985 ;;
+        4) echo 1969 ;; 5) echo 3938 ;; 6) echo 7680 ;;
+        *) echo 0 ;;
+    esac
+}
+
+pcie_link_capacity_mbps() { # gen width -> total theoretical capacity MB/s
+    _g=$(num_or_empty "${1:-}")
+    _w=$(num_or_empty "${2:-}")
+    [ -n "$_g" ] && [ -n "$_w" ] || { echo 0; return 0; }
+    _per_lane=$(pcie_lane_mbps "$_g")
+    echo $((_per_lane * _w))
+}
+
+pcie_collect() {
+    PCIE_CUR_SPEED=""; PCIE_MAX_SPEED=""
+    PCIE_CUR_GEN=""; PCIE_CUR_WIDTH=""; PCIE_MAX_GEN=""; PCIE_MAX_WIDTH=""
+    PCIE_BEST_GEN=""; PCIE_BEST_WIDTH=""; PCIE_DOWNTRAINED=""; PCIE_SOURCE=""
+    [ -n "$GPU_ADDR" ] || return 0
+    _d="$NODEOS_SYSFS/bus/pci/devices/$GPU_ADDR"
+    PCIE_CUR_SPEED=$(rd "$_d/current_link_speed"); PCIE_MAX_SPEED=$(rd "$_d/max_link_speed")
+    PCIE_CUR_WIDTH=$(num_or_empty "$(rd "$_d/current_link_width")")
+    PCIE_MAX_WIDTH=$(num_or_empty "$(rd "$_d/max_link_width")")
+    PCIE_CUR_GEN=$(pcie_gen "$PCIE_CUR_SPEED"); PCIE_MAX_GEN=$(pcie_gen "$PCIE_MAX_SPEED")
+    PCIE_SOURCE=sysfs
+    if [ -z "$PCIE_CUR_GEN" ] && [ -z "$PCIE_CUR_WIDTH" ]; then
+        PCIE_CUR_GEN=$(num_or_empty "$SMI_GEN_CUR"); PCIE_MAX_GEN=$(num_or_empty "$SMI_GEN_MAX")
+        PCIE_CUR_WIDTH=$(num_or_empty "$SMI_W_CUR"); PCIE_MAX_WIDTH=$(num_or_empty "$SMI_W_MAX")
+        [ -z "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ] || PCIE_SOURCE=nvidia-smi
+    fi
+    # Idle GPUs legitimately downtrain; remember the best observed link pair (gen, width) seen this boot.
+    # Evaluation uses theoretical link capacity (per-lane MB/s * width); tie-break prefers higher generation.
+    _bf="$NODEOS_RUN/pcie-best.env"
+    BEST_GEN=""; BEST_WIDTH=""
+    if [ -r "$_bf" ]; then
+        . "$_bf" 2>/dev/null || true
+        BEST_GEN=$(num_or_empty "${BEST_GEN:-}")
+        BEST_WIDTH=$(num_or_empty "${BEST_WIDTH:-}")
+    fi
+    if [ -n "${PCIE_CUR_GEN:-}" ] && [ -n "${PCIE_CUR_WIDTH:-}" ]; then
+        _cur_cap=$(pcie_link_capacity_mbps "$PCIE_CUR_GEN" "$PCIE_CUR_WIDTH")
+        _best_cap=0
+        if [ -n "${BEST_GEN:-}" ] && [ -n "${BEST_WIDTH:-}" ]; then
+            _best_cap=$(pcie_link_capacity_mbps "$BEST_GEN" "$BEST_WIDTH")
+        fi
+        if [ "$_cur_cap" -gt 0 ]; then
+            if [ "$_cur_cap" -gt "$_best_cap" ] || \
+               { [ "$_cur_cap" -eq "$_best_cap" ] && [ "$PCIE_CUR_GEN" -gt "${BEST_GEN:-0}" ]; }; then
+                BEST_GEN=$PCIE_CUR_GEN
+                BEST_WIDTH=$PCIE_CUR_WIDTH
+            fi
+        fi
+    fi
+    printf 'BEST_GEN=%s\nBEST_WIDTH=%s\n' "$(sq "${BEST_GEN:-}")" "$(sq "${BEST_WIDTH:-}")" >"$_bf.$$"
+    mv -f "$_bf.$$" "$_bf"
+    PCIE_BEST_GEN=${BEST_GEN:-}; PCIE_BEST_WIDTH=${BEST_WIDTH:-}
+    PCIE_DOWNTRAINED=""
+    if [ -n "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ] && [ -n "$PCIE_MAX_GEN" ] && [ -n "$PCIE_MAX_WIDTH" ] &&
+       [ -n "$PCIE_CUR_GEN" ] && [ -n "$PCIE_CUR_WIDTH" ]; then
+        if [ "$PCIE_CUR_GEN" -lt "$PCIE_MAX_GEN" ] || [ "$PCIE_CUR_WIDTH" -lt "$PCIE_MAX_WIDTH" ]; then
+            PCIE_DOWNTRAINED=1
+        else PCIE_DOWNTRAINED=0; fi
+    fi
+    return 0
+}
+
+payload_gate() {
+    _cache="$NODEOS_RUN/.payload-gate"
+    PAYLOAD_SHA=""
+    if [ -e "$NODEOS_ETC/nvidia-payload-missing" ] || [ ! -r "$NODEOS_ETC/nvidia-payload-manifest.json" ]; then
+        set_gate payload FAIL payload-missing "no vendor payload in image"; return 0
+    fi
+    PAYLOAD_SHA=$(sha256sum "$NODEOS_ETC/nvidia-payload-manifest.json" | cut -d' ' -f1)
+    if [ ! -r "$_cache" ]; then
+        if [ ! -r "$NODEOS_ETC/nvidia-payload.sha256" ]; then
+            echo "FAIL payload-digests-missing" >"$_cache.$$"
+        elif sha256sum -c "$NODEOS_ETC/nvidia-payload.sha256" >/dev/null 2>&1; then
+            echo "PASS" >"$_cache.$$"
+        else
+            echo "FAIL payload-digest-mismatch" >"$_cache.$$"
+        fi
+        mv -f "$_cache.$$" "$_cache"
+    fi
+    _r=$(cat "$_cache")
+    case "$_r" in
+        PASS) set_gate payload PASS "" "sha256 $(printf '%s' "$PAYLOAD_SHA" | cut -c1-12)" ;;
+        *) set_gate payload FAIL "${_r#FAIL }" "payload digest check failed" ;;
+    esac
+}
+
+driver_gate() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        set_gate driver FAIL nvidia-smi-missing "nvidia-smi not installed"
+    elif ! nvidia-smi -L >/dev/null 2>&1; then
+        set_gate driver FAIL driver-not-ready "nvidia-smi -L failed"
+    else
+        set_gate driver PASS "" "driver ${DRIVER:-?}"
+    fi
+}
+
+cuda_gate() {
+    CUDA_JSON="$NODEOS_RUN/cuda-smoke.json"
+    if [ "$GATE_driver" != PASS ]; then
+        set_gate cuda NA driver-not-ready "driver gate not passed"; return 0
+    fi
+    _st=$(json_get "$CUDA_JSON" status)
+    if [ "$_st" != PASS ] || [ $((CYCLE % ${NODEOS_CUDA_RECHECK_CYCLES:-30})) -eq 0 ]; then
+        if [ -x "$NODEOS_BIN/nodeos-cuda-smoke" ]; then
+            "$NODEOS_BIN/nodeos-cuda-smoke" --quiet >/dev/null 2>&1 || true
+        else
+            printf '{"schema":"resonarch.nodeos.cuda-smoke.v1","status":"FAIL","reason":"cuda-smoke-missing"}\n' >"$CUDA_JSON"
+        fi
+        _st=$(json_get "$CUDA_JSON" status)
+    fi
+    if [ "$_st" = PASS ]; then
+        set_gate cuda PASS "" "sm $(json_get "$CUDA_JSON" compute_capability) $(json_get "$CUDA_JSON" device)"
+    else
+        _r=$(json_get "$CUDA_JSON" reason)
+        if [ -z "$_r" ]; then _r=$(json_get "$CUDA_JSON" stage); [ -z "$_r" ] || _r="stage:$_r"; fi
+        set_gate cuda FAIL "${_r:-cuda-probe-failed}" "CUDA smoke ${_st:-missing}"
+    fi
+}
+
+network_gate() {
+    NG_STATUS=""; NG_REASON=""; NG_PING_RESULT=""; NG_LOSS=""; NG_RTT=""
+    NG_IPERF_RESULT=""; NG_IPERF_MBIT=""; NG_ERRORS=""; NG_SPEED=""; NG_DUPLEX=""
+    if [ "$GATE_link" != PASS ]; then
+        rm -f "$NODEOS_RUN/network.env" "$NODEOS_RUN/network.json"
+        set_gate network NA not-run "link gate not passed"; return 0
+    fi
+    _full=0
+    if [ ! -r "$NODEOS_RUN/network.env" ] || [ $((CYCLE % ${NODEOS_NETGATE_EVERY:-3})) -eq 0 ]; then
+        if [ ! -r "$NODEOS_RUN/iperf.env" ] && [ "${NODEOS_IPERF_AUTO:-1}" = 1 ] && [ -n "${NODEOS_PEER_IPV4:-}" ]; then
+            _full=1
+        fi
+        if [ "$_full" = 1 ]; then "$NODEOS_BIN/nodeos-netgate" --full >/dev/null 2>&1 || true
+        else "$NODEOS_BIN/nodeos-netgate" --ping >/dev/null 2>&1 || true; fi
+    fi
+    if [ -r "$NODEOS_RUN/network.env" ]; then . "$NODEOS_RUN/network.env"; fi
+    case "${NG_STATUS:-}" in
+        PASS) set_gate network PASS "" "peer ${NG_PEER:-} rtt ${NG_RTT:-?} ms" ;;
+        SKIPPED) set_gate network SKIPPED "${NG_REASON:-}" "no peer measurement" ;;
+        FAIL) set_gate network FAIL "${NG_REASON:-network-failed}" "network gate failed" ;;
+        *) set_gate network NA not-run "network gate has not run" ;;
+    esac
+}
+
+compute_state() {
+    STATE=NODE_READY; STATE_REASON=""; STAGE=BOOTING
+    for _g in $NODEOS_CHAIN; do
+        _st=$(gv "$_g"); _rs=$(gv "$_g" _REASON)
+        _ok=0
+        if [ "$_st" = PASS ]; then
+            _ok=1
+        elif [ "$_g" = network ] && [ "${NODEOS_REQUIRE_PEER:-0}" != 1 ]; then
+            if [ "$_st" = SKIPPED ] || [ "$_st" = NA ]; then
+                _ok=1
+            fi
+        fi
+        if [ "$_ok" = 1 ]; then STAGE=$(nodeos_stage_of "$_g"); continue; fi
+        STATE=$(nodeos_blocked_of "$_g" "$_rs"); STATE_REASON=$_rs
+        break
+    done
+    VERDICT=PASS
+    [ "$STATE" = NODE_READY ] || VERDICT=FAIL
+    if [ "$VERDICT" = PASS ]; then
+        case "$GATE_network" in
+            PASS) ;;
+            SKIPPED|NA) VERDICT=INCOMPLETE ;;
+            *) VERDICT=FAIL ;;
+        esac
+        [ "$GATE_uefi" = PASS ] || VERDICT=FAIL
+    fi
+}
+
+log_changes() {
+    _gl="$NODEOS_RUN/gates.last"
+    for _g in $NODEOS_ALL_GATES; do
+        _st=$(gv "$_g"); _rs=$(gv "$_g" _REASON); _dt=$(gv "$_g" _DETAIL)
+        _old=$(grep "^$_g " "$_gl" 2>/dev/null || true)
+        if [ "$_old" != "$_g $_st $_rs" ]; then
+            nlog "GATE $_g $_st ${_rs:-$_dt}"
+        fi
+    done
+    for _g in $NODEOS_ALL_GATES; do
+        printf '%s %s %s\n' "$_g" "$(gv "$_g")" "$(gv "$_g" _REASON)"
+    done >"$_gl.$$"
+    mv -f "$_gl.$$" "$_gl"
+    _prev=$(rd "$NODEOS_RUN/state")
+    if [ "$_prev" != "$STATE" ]; then
+        nlog "NODE STATE ${_prev:-BOOTING} -> $STATE${STATE_REASON:+ ($STATE_REASON)}"
+    fi
+    printf '%s\n' "$STATE" >"$NODEOS_RUN/state.$$"
+    mv -f "$NODEOS_RUN/state.$$" "$NODEOS_RUN/state"
+}
+
+write_gate_report() {
+    {
+        printf '{\n'
+        printf '  "schema":"resonarch.nodeos.gate-report.v1",\n'
+        printf '  "node_id":"%s",\n' "$(json_escape "$NODE_ID")"
+        printf '  "boot_id":"%s",\n' "$(json_escape "$BOOT_ID")"
+        printf '  "state":"%s",\n' "$STATE"
+        printf '  "state_reason":"%s",\n' "$(json_escape "$STATE_REASON")"
+        printf '  "stage":"%s",\n' "$STAGE"
+        printf '  "verdict":"%s",\n' "$VERDICT"
+        printf '  "gates":[\n'
+        _sep=""
+        for _g in $NODEOS_ALL_GATES; do
+            _st=$(gv "$_g"); _rs=$(gv "$_g" _REASON); _dt=$(gv "$_g" _DETAIL)
+            _blk=true; [ "$_g" != uefi ] || _blk=false
+            printf '%s    {"name":"%s","stage":"%s","status":"%s","reason":"%s","detail":"%s","blocking":%s}' \
+                "$_sep" "$_g" "$(nodeos_stage_of "$_g")" "$_st" "$(json_escape "$_rs")" "$(json_escape "$_dt")" "$_blk"
+            _sep=",
+"
+        done
+        printf '\n  ]\n}\n'
+    } >"$NODEOS_RUN/gate-report.json.$$"
+    mv -f "$NODEOS_RUN/gate-report.json.$$" "$NODEOS_RUN/gate-report.json"
+}
+
+pcie_json_body() {
+    printf '"address":"%s","source":"%s","current":{"speed":"%s","generation":%s,"width":%s},"maximum":{"speed":"%s","generation":%s,"width":%s},"best_observed":{"generation":%s,"width":%s},"downtrained_now":%s,"note":"%s"' \
+        "$(json_escape "$GPU_ADDR")" "$(json_escape "$PCIE_SOURCE")" \
+        "$(json_escape "$PCIE_CUR_SPEED")" "$(json_num "$PCIE_CUR_GEN")" "$(json_num "$PCIE_CUR_WIDTH")" \
+        "$(json_escape "$PCIE_MAX_SPEED")" "$(json_num "$PCIE_MAX_GEN")" "$(json_num "$PCIE_MAX_WIDTH")" \
+        "$(json_num "$PCIE_BEST_GEN")" "$(json_num "$PCIE_BEST_WIDTH")" "$(json_bool "$PCIE_DOWNTRAINED")" \
+        "idle GPUs may report a reduced link; best_observed is the maximum seen this boot (sampled after the CUDA probe)"
+}
+
+write_capability() {
+    _cuda_state=UNAVAILABLE
+    case "$GATE_cuda" in PASS) _cuda_state=PASS ;; FAIL) _cuda_state=FAIL ;; esac
+    _gname=${GPU_NAME:-$GPU_LSPCI_NAME}
+    _uefi=false; [ "$GATE_uefi" != PASS ] || _uefi=true
+    tmp="$OUT.$$"
     {
         printf '{\n'
         printf '  "schema":"resonarch.nodeos.capability.v1",\n'
-        printf '  "node_id":"%s","state":"%s","kernel":"%s",\n' "$(json_escape "$NODE_ID")" "$state" "$(json_escape "$kernel")"
-        printf '  "cpu":{"model":"%s","logical_processors":%s},\n' "$(json_escape "$cpu_model")" "$cpu_logical"
-        printf '  "memory":{"total_kib":%s},\n' "$mem_kib"
-        printf '  "network":{"interface":"%s","ipv4":"%s","peer":"%s"},\n' "$(json_escape "$iface")" "$(json_escape "$ipv4")" "$(json_escape "${NODEOS_PEER_IPV4:-}")"
-        printf '  "accelerators":[{"vendor":"NVIDIA","profile":"%s","pci":"%s","name":"%s","driver":"%s"}],\n' "$(json_escape "$NODEOS_GPU_PROFILE")" "$(json_escape "$gpu_pci")" "$(json_escape "$gpu_name")" "$(json_escape "$driver")"
-        printf '  "health":{"cuda_smoke":"%s"}\n' "$cuda_status"
+        printf '  "node_id":"%s","state":"%s","state_reason":"%s","stage":"%s","verdict":"%s","kernel":"%s",\n' \
+            "$(json_escape "$NODE_ID")" "$STATE" "$(json_escape "$STATE_REASON")" "$STAGE" "$VERDICT" "$(json_escape "$KERNEL")"
+        printf '  "system":{"boot_id":"%s","uptime_s":%s,"uefi":%s,"profile":"%s","nodeos_commit":"%s","nodeos_dirty":%s,"buildroot_commit":"%s","nvidia_payload_sha256":"%s",\n' \
+            "$(json_escape "$BOOT_ID")" "$(json_num "$UPTIME_S")" "$_uefi" "$(json_escape "${NODEOS_BUILD_PROFILE:-unknown}")" \
+            "$(json_escape "${NODEOS_BUILD_COMMIT:-unknown}")" "$(json_bool "${NODEOS_BUILD_DIRTY:-}")" \
+            "$(json_escape "${NODEOS_BUILDROOT_COMMIT:-unknown}")" "$(json_escape "$PAYLOAD_SHA")"
+        printf '    "cuda":{"device":"%s","compute_capability":"%s","runtime_version":%s,"driver_version":%s}},\n' \
+            "$(json_escape "$(json_get "$NODEOS_RUN/cuda-smoke.json" device)")" \
+            "$(json_escape "$(json_get "$NODEOS_RUN/cuda-smoke.json" compute_capability)")" \
+            "$(json_num "$(json_get "$NODEOS_RUN/cuda-smoke.json" runtime_version)")" \
+            "$(json_num "$(json_get "$NODEOS_RUN/cuda-smoke.json" driver_version)")"
+        printf '  "cpu":{"model":"%s","logical_processors":%s},\n' "$(json_escape "$CPU_MODEL")" "$(json_num "$CPU_LOGICAL")"
+        printf '  "memory":{"total_kib":%s},\n' "$(json_num "$MEM_KIB")"
+        printf '  "network":{"interface":"%s","ipv4":"%s","peer":"%s","mac":"%s","driver":"%s","speed_mbps":%s,"duplex":"%s","carrier":%s,"mtu":%s,' \
+            "$(json_escape "$NET_IFACE")" "$(json_escape "$NET_IPV4")" "$(json_escape "${NODEOS_PEER_IPV4:-}")" \
+            "$(json_escape "$NET_MAC")" "$(json_escape "$NET_DRIVER")" "$(json_num "$NET_SPEED")" \
+            "$(json_escape "$NET_DUPLEX")" "$(json_bool "$NET_CARRIER")" "$(json_num "$NET_MTU")"
+        printf '"rx_bytes":%s,"tx_bytes":%s,"rx_packets":%s,"tx_packets":%s,"rx_errors":%s,"tx_errors":%s,"rx_dropped":%s,"tx_dropped":%s,"gate":"%s"},\n' \
+            "$(json_num "$NET_RX_BYTES")" "$(json_num "$NET_TX_BYTES")" "$(json_num "$NET_RX_PACKETS")" "$(json_num "$NET_TX_PACKETS")" \
+            "$(json_num "$NET_RX_ERRORS")" "$(json_num "$NET_TX_ERRORS")" "$(json_num "$NET_RX_DROPPED")" "$(json_num "$NET_TX_DROPPED")" \
+            "$GATE_network"
+        printf '  "accelerators":[{"vendor":"NVIDIA","profile":"%s","pci":"%s","pci_address":"%s","name":"%s","driver":"%s","uuid":"%s",\n' \
+            "$(json_escape "$NODEOS_GPU_PROFILE")" "$(json_escape "$GPU_PCI_LINE")" "$(json_escape "$GPU_ADDR")" \
+            "$(json_escape "$_gname")" "$(json_escape "$DRIVER")" "$(json_escape "$GPU_UUID")"
+        printf '    "memory_mib":{"total":%s,"used":%s,"free":%s},"temperature_c":%s,"clocks_mhz":{"sm":%s,"mem":%s},"utilization_pct":%s,"power_w":{"draw":%s,"limit":%s},\n' \
+            "$(json_num "$GPU_MEM_TOTAL")" "$(json_num "$GPU_MEM_USED")" "$(json_num "$GPU_MEM_FREE")" "$(json_num "$GPU_TEMP")" \
+            "$(json_num "$GPU_CLK_SM")" "$(json_num "$GPU_CLK_MEM")" "$(json_num "$GPU_UTIL")" \
+            "$(json_num "$GPU_POWER")" "$(json_num "$GPU_POWER_LIMIT")"
+        printf '    "pcie":{%s}}],\n' "$(pcie_json_body)"
+        printf '  "health":{"cuda_smoke":"%s"}\n' "$_cuda_state"
         printf '}\n'
-    } > "$tmp"
-    mv "$tmp" "$OUT"
-    if [ "$state" = "READY" ]; then : > /run/nodeos/ready; else rm -f /run/nodeos/ready; fi
+    } >"$tmp"
+    mv -f "$tmp" "$OUT"
+    if [ -n "$GPU_ADDR" ]; then
+        printf '{\n  "schema":"resonarch.nodeos.pcie.v1",\n  %s\n}\n' "$(pcie_json_body)" >"$NODEOS_RUN/pcie.json.$$"
+    else
+        printf '{\n  "schema":"resonarch.nodeos.pcie.v1",\n  "address":"","source":"none","note":"no NVIDIA PCI function discovered"\n}\n' >"$NODEOS_RUN/pcie.json.$$"
+    fi
+    mv -f "$NODEOS_RUN/pcie.json.$$" "$NODEOS_RUN/pcie.json"
+}
+
+write_status_env() {
+    {
+        for _v in NODE_ID BOOT_ID UPTIME_S KERNEL CPU_MODEL CPU_LOGICAL MEM_KIB STATE STATE_REASON STAGE VERDICT \
+                  NODEOS_BUILD_COMMIT NODEOS_BUILD_PROFILE NODEOS_PEER_IPV4 PAYLOAD_SHA \
+                  GPU_NAME GPU_LSPCI_NAME GPU_ADDR GPU_UUID DRIVER GPU_MEM_TOTAL GPU_MEM_FREE GPU_MEM_USED GPU_TEMP \
+                  GPU_CLK_SM GPU_CLK_MEM GPU_UTIL GPU_POWER GPU_POWER_LIMIT \
+                  PCIE_CUR_SPEED PCIE_CUR_GEN PCIE_CUR_WIDTH PCIE_MAX_GEN PCIE_MAX_WIDTH PCIE_BEST_GEN PCIE_BEST_WIDTH PCIE_DOWNTRAINED \
+                  NET_IFACE NET_IPV4 NET_MAC NET_DRIVER NET_SPEED NET_DUPLEX NET_CARRIER NET_MTU \
+                  NET_RX_BYTES NET_TX_BYTES NET_RX_ERRORS NET_TX_ERRORS NET_RX_DROPPED NET_TX_DROPPED \
+                  NG_STATUS NG_REASON NG_PING_RESULT NG_LOSS NG_RTT NG_IPERF_RESULT NG_IPERF_MBIT NG_ERRORS; do
+            eval "_val=\${$_v:-}"
+            printf '%s=%s\n' "$_v" "$(sq "$_val")"
+        done
+        for _g in $NODEOS_ALL_GATES; do
+            printf 'GATE_%s=%s\nGATE_%s_REASON=%s\nGATE_%s_DETAIL=%s\n' \
+                "$_g" "$(sq "$(gv "$_g")")" "$_g" "$(sq "$(gv "$_g" _REASON)")" "$_g" "$(sq "$(gv "$_g" _DETAIL)")"
+        done
+    } >"$NODEOS_RUN/status.env.$$"
+    mv -f "$NODEOS_RUN/status.env.$$" "$NODEOS_RUN/status.env"
+}
+
+maybe_evidence() {
+    [ "${NODEOS_EVIDENCE_AUTO:-1}" = 1 ] || return 0
+    _sig="$STATE/$VERDICT/$STATE_REASON"
+    if [ "$_sig" = "$LAST_SIG" ]; then STABLE=$((STABLE + 1)); else STABLE=0; fi
+    LAST_SIG=$_sig
+    [ "$STABLE" -ge "${NODEOS_EVIDENCE_STABLE_CYCLES:-3}" ] || return 0
+    [ "$(rd "$NODEOS_RUN/evidence.sig")" != "$_sig" ] || return 0
+    if [ -x "$NODEOS_BIN/nodeos-evidence" ]; then
+        if "$NODEOS_BIN/nodeos-evidence" collect --auto >/dev/null 2>&1; then
+            printf '%s\n' "$_sig" >"$NODEOS_RUN/evidence.sig"
+        else
+            nlog "EVIDENCE collection failed"
+        fi
+    fi
+}
+
+collect_once() {
+    BOOT_ID=$(rd "$NODEOS_PROCFS/sys/kernel/random/boot_id"); BOOT_ID=${BOOT_ID:-unknown-boot}
+    UPTIME_S=$(rd "$NODEOS_PROCFS/uptime"); UPTIME_S=${UPTIME_S%% *}; UPTIME_S=${UPTIME_S%%.*}
+    CPU_MODEL=$(awk -F': ' '/model name/ {print $2; exit}' "$NODEOS_PROCFS/cpuinfo" 2>/dev/null || true)
+    CPU_LOGICAL=$(grep -c '^processor' "$NODEOS_PROCFS/cpuinfo" 2>/dev/null || echo 0)
+    MEM_KIB=$(awk '/MemTotal:/ {print $2}' "$NODEOS_PROCFS/meminfo" 2>/dev/null || echo 0)
+    KERNEL=$(uname -r)
+
+    if [ -d "$NODEOS_SYSFS/firmware/efi" ]; then set_gate uefi PASS "" "UEFI firmware interface present"
+    else set_gate uefi FAIL not-uefi-boot "no /sys/firmware/efi"; fi
+    if [ -n "$KERNEL" ] && [ "${CPU_LOGICAL:-0}" -gt 0 ]; then set_gate kernel PASS "" "linux $KERNEL"
+    else set_gate kernel FAIL kernel-not-ready "no kernel/cpu info"; fi
+
+    nodeos_net_collect
+    if [ -n "$NET_IFACE" ]; then set_gate nic PASS "" "$NET_IFACE ${NET_DRIVER:+driver=$NET_DRIVER }mac=${NET_MAC:-?}"
+    else set_gate nic FAIL no-nic "no non-loopback interface"; fi
+    if [ -z "$NET_IFACE" ]; then set_gate link NA no-nic "no interface"
+    elif [ "$NET_CARRIER" != 1 ]; then set_gate link FAIL no-carrier "$NET_IFACE carrier=${NET_CARRIER:-?}"
+    elif [ -z "$NET_IPV4" ]; then set_gate link FAIL no-ipv4 "$NET_IFACE has no IPv4 address"
+    else set_gate link PASS "" "$NET_IFACE $NET_IPV4 ${NET_SPEED:-?}Mb/s ${NET_DUPLEX:-?}"; fi
+
+    gpu_discover
+    if [ -n "$GPU_PCI_LINE" ]; then set_gate gpu PASS "" "PCI $GPU_ADDR ${GPU_LSPCI_NAME:-NVIDIA}"
+    else set_gate gpu FAIL gpu-missing "no NVIDIA PCI function"; fi
+    gpu_query
+    payload_gate
+    driver_gate
+    cuda_gate
+    gpu_query            # refresh VRAM/clocks/power after the CUDA probe
+    pcie_collect
+    network_gate
+    compute_state
+
+    log_changes
+    write_gate_report
+    write_capability
+    write_status_env
+    if [ "$STATE" = NODE_READY ] && [ "$VERDICT" = PASS ]; then
+        : >"$NODEOS_RUN/ready"
+    else
+        rm -f "$NODEOS_RUN/ready"
+    fi
 }
 
 case "${1:-run}" in
   --once) collect_once; cat "$OUT" ;;
-  run) while :; do collect_once; sleep "$INTERVAL"; done ;;
+  run)
+    nlog "AGENT start node=$NODE_ID kernel=$(uname -r)"
+    while :; do
+        collect_once
+        maybe_evidence
+        nodeos_log_trim
+        CYCLE=$((CYCLE + 1))
+        sleep "$INTERVAL"
+    done ;;
   *) echo "usage: nodeos-agent [run|--once]" >&2; exit 2 ;;
 esac

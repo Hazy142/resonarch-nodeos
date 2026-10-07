@@ -18,6 +18,6 @@ jobs:
           set -euo pipefail
           while IFS= read -r -d '' file; do
             bash -n "$file"
-          done < <(find scripts buildroot -type f \( -name '*.sh' -o -path '*/etc/init.d/S*' -o -name 'nodeos-agent' -o -name 'nodeos-cuda-smoke' \) -print0)
+          done < <(find scripts buildroot -type f \( -name '*.sh' -o -path '*/etc/init.d/S*' -o -name 'nodeos-*' \) -print0)
       - name: Validate Buildroot defconfig
         run: ./scripts/build-nodeos.sh --configure-only

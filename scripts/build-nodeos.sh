@@ -13,6 +13,8 @@ for arg in "$@"; do
   --configure-only) CONFIG_ONLY=1 ;;
   --profile=dell-g15-5530) PROFILE=dell-g15-5530 ;;
   --profile=haswell-gtx1070ti) PROFILE=haswell-gtx1070ti ;;
+  # Key-only SSH over the direct LAN (single ssh-ed25519 public key file).
+  --ssh-pubkey=*) export NODEOS_SSH_PUBKEY="${arg#--ssh-pubkey=}" ;;
   *) echo "unknown option: $arg" >&2; exit 2 ;;
  esac
 done
@@ -49,6 +51,19 @@ if [[ -f "$PAYLOAD/manifest.json" ]]; then
 else
   unset NODEOS_NVIDIA_PAYLOAD || true
   echo "NodeOS: no NVIDIA vendor payload; base image will boot but CUDA readiness fails closed."
+fi
+
+# Build identity baked into /etc/nodeos/build-info (and into every evidence bundle).
+export NODEOS_BUILD_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null || true)" ]]; then
+  export NODEOS_BUILD_DIRTY=1
+else
+  export NODEOS_BUILD_DIRTY=0
+fi
+export NODEOS_BUILDROOT_COMMIT="$BR_COMMIT"
+export NODEOS_BUILD_PROFILE="$MANIFEST_PROFILE"
+if [[ "$NODEOS_BUILD_DIRTY" == 1 ]]; then
+  echo "NodeOS: WARNING working tree is dirty; evidence will record nodeos_dirty=true."
 fi
 
 make -C "$BR_DIR" BR2_EXTERNAL="$ROOT/buildroot" O="$OUT" "$DEFCONFIG"

@@ -1,0 +1,162 @@
+#!/bin/sh
+# nodeos-evidence: reproducible, hash-sealed evidence bundle for physical runs.
+#
+#   nodeos-evidence collect [--refresh|--auto]
+#   nodeos-evidence export [DEST_DIR]       (also: nodeos-evidence-export)
+#   nodeos-evidence verify DIR
+#
+# Bundle: $NODEOS_RUN/evidence/<boot-id>/ with manifest.json + SHA256SUMS.
+# Evidence ID = SHA-256 of manifest.json (which lists every other file's hash).
+set -eu
+NODEOS_LIB=${NODEOS_LIB:-/usr/lib/nodeos/nodeos-lib.sh}
+. "$NODEOS_LIB"
+nodeos_load_conf
+
+EVROOT="$NODEOS_RUN/evidence"
+PERSIST=${NODEOS_EVIDENCE_PERSIST:-/var/lib/nodeos/evidence}
+KEEP=${NODEOS_EVIDENCE_KEEP:-5}
+if [ "$(basename "$0")" = nodeos-evidence-export ]; then
+    cmd=export
+else
+    cmd=${1:-collect}
+    if [ $# -gt 0 ]; then shift; fi
+fi
+
+TMO=""
+command -v timeout >/dev/null 2>&1 && TMO="timeout 20"
+
+capture() { # file command...
+    _f=$1; shift
+    if command -v "$1" >/dev/null 2>&1; then
+        { $TMO "$@" 2>&1 || echo "[exit status $?]"; } >"$_f" || true
+    else
+        echo "unavailable: $1 not installed" >"$_f"
+    fi
+}
+
+do_collect() {
+    case "${1:-}" in
+        --refresh) "$NODEOS_BIN/nodeos-agent" --once >/dev/null 2>&1 || true ;;
+    esac
+    BOOT_ID=$(rd "$NODEOS_PROCFS/sys/kernel/random/boot_id"); BOOT_ID=${BOOT_ID:-unknown-boot}
+    mkdir -p "$EVROOT"
+    tmp="$EVROOT/.tmp.$$"
+    rm -rf "$tmp"; mkdir -p "$tmp"
+
+    missing=""
+    for f in capability.json cuda-smoke.json network.json pcie.json gate-report.json; do
+        if [ -r "$NODEOS_RUN/$f" ]; then cp "$NODEOS_RUN/$f" "$tmp/$f"
+        else missing="${missing:+$missing,}$f"; fi
+    done
+    if [ -r "$NODEOS_LOG" ]; then cp "$NODEOS_LOG" "$tmp/nodeos-agent.log"; else missing="${missing:+$missing,}nodeos-agent.log"; fi
+    [ ! -r "$NODEOS_ETC/build-info" ] || cp "$NODEOS_ETC/build-info" "$tmp/build-info.txt"
+    [ ! -r "$NODEOS_ETC/nvidia-payload-manifest.json" ] || cp "$NODEOS_ETC/nvidia-payload-manifest.json" "$tmp/nvidia-payload-manifest.json"
+    capture "$tmp/nvidia-smi.txt" nvidia-smi -q
+    capture "$tmp/lspci.txt" lspci -nn -vv
+    capture "$tmp/ip-link.txt" ip -s link
+    if [ -n "${NODEOS_INTERFACE:-}" ]; then _if=$NODEOS_INTERFACE
+    else _if=$(nodeos_find_iface 2>/dev/null || true); fi
+    [ -z "$_if" ] || capture "$tmp/ethtool.txt" ethtool "$_if"
+    if command -v dmesg >/dev/null 2>&1; then dmesg 2>/dev/null | tail -n 400 >"$tmp/dmesg-tail.txt" || true
+    else echo "unavailable: dmesg not installed" >"$tmp/dmesg-tail.txt"; fi
+
+    G="$tmp/gate-report.json"
+    STATE=$(json_get "$G" state); STATE_REASON=$(json_get "$G" state_reason); VERDICT=$(json_get "$G" verdict)
+    STATE=${STATE:-UNKNOWN}; VERDICT=${VERDICT:-FAIL}
+    UPTIME_S=$(rd "$NODEOS_PROCFS/uptime"); UPTIME_S=${UPTIME_S%% *}; UPTIME_S=${UPTIME_S%%.*}
+
+    {
+        printf '{\n'
+        printf '  "schema":"resonarch.nodeos.evidence-manifest.v1",\n'
+        printf '  "node_id":"%s",\n' "$(json_escape "${NODEOS_NODE_ID:-unknown}")"
+        printf '  "boot_id":"%s",\n' "$(json_escape "$BOOT_ID")"
+        printf '  "created_utc":"%s","uptime_s":%s,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(json_num "$UPTIME_S")"
+        printf '  "state":"%s","state_reason":"%s","verdict":"%s",\n' "$STATE" "$(json_escape "$STATE_REASON")" "$VERDICT"
+        printf '  "profile":"%s","nodeos_commit":"%s","buildroot_commit":"%s",\n' \
+            "$(json_escape "${NODEOS_BUILD_PROFILE:-unknown}")" "$(json_escape "${NODEOS_BUILD_COMMIT:-unknown}")" \
+            "$(json_escape "${NODEOS_BUILDROOT_COMMIT:-unknown}")"
+        printf '  "missing":"%s",\n' "$(json_escape "$missing")"
+        printf '  "files":[\n'
+        sep=""
+        for f in "$tmp"/*; do
+            n=$(basename "$f")
+            b=$(wc -c <"$f" | tr -d ' ')
+            h=$(sha256sum "$f" | cut -d' ' -f1)
+            printf '%s    {"name":"%s","bytes":%s,"sha256":"%s"}' "$sep" "$(json_escape "$n")" "$b" "$h"
+            sep=",
+"
+        done
+        printf '\n  ]\n}\n'
+    } >"$EVROOT/.manifest.$$"
+    mv -f "$EVROOT/.manifest.$$" "$tmp/manifest.json"
+
+    (cd "$tmp" && sha256sum * >"../.sums.$$") && mv -f "$EVROOT/.sums.$$" "$tmp/SHA256SUMS"
+    EVIDENCE_ID=$(sha256sum "$tmp/manifest.json" | cut -d' ' -f1)
+
+    dir="$EVROOT/$BOOT_ID"
+    rm -rf "$dir"; mv "$tmp" "$dir"
+    {
+        printf 'EVIDENCE_ID=%s\n' "$(sq "$EVIDENCE_ID")"
+        printf 'EVIDENCE_DIR=%s\n' "$(sq "$dir")"
+        printf 'EVIDENCE_BOOT_ID=%s\n' "$(sq "$BOOT_ID")"
+        printf 'EVIDENCE_VERDICT=%s\n' "$(sq "$VERDICT")"
+        printf 'EVIDENCE_STATE=%s\n' "$(sq "$STATE")"
+        printf 'EVIDENCE_REASON=%s\n' "$(sq "$STATE_REASON")"
+    } >"$EVROOT/latest.env.$$"
+    mv -f "$EVROOT/latest.env.$$" "$EVROOT/latest.env"
+
+    # Best-effort persistence across reboots; never fatal.
+    if mkdir -p "$PERSIST" 2>/dev/null; then
+        rm -rf "$PERSIST/$BOOT_ID" 2>/dev/null || true
+        cp -R "$dir" "$PERSIST/$BOOT_ID" 2>/dev/null || true
+        n=0
+        for old in $(ls -t "$PERSIST" 2>/dev/null); do
+            n=$((n + 1))
+            [ "$n" -le "$KEEP" ] || rm -rf "${PERSIST:?}/$old" 2>/dev/null || true
+        done
+    fi
+    nlog "EVIDENCE id=$EVIDENCE_ID verdict=$VERDICT state=$STATE"
+    if [ "${1:-}" != --auto ]; then banner; fi
+}
+
+banner() {
+    case "$VERDICT" in
+        PASS) echo "NODEOS-001 PHYSICAL PASS" ;;
+        INCOMPLETE) echo "NODEOS-001 PHYSICAL INCOMPLETE ($STATE${STATE_REASON:+: $STATE_REASON}; peer network gate not measured)" ;;
+        *) echo "NODEOS-001 PHYSICAL FAIL ($STATE${STATE_REASON:+: $STATE_REASON})" ;;
+    esac
+    printf '\nEvidence ID:\n%s\n\nExport:\nnodeos-evidence-export\n' "$EVIDENCE_ID"
+}
+
+do_export() {
+    if [ ! -r "$EVROOT/latest.env" ]; then do_collect --refresh >/dev/null; fi
+    . "$EVROOT/latest.env"
+    short=$(printf '%s' "$EVIDENCE_ID" | cut -c1-12)
+    tarname="nodeos-evidence-$short.tar"
+    tar -cf "$NODEOS_RUN/$tarname" -C "$EVROOT" "$EVIDENCE_BOOT_ID"
+    echo "EXPORT_BUNDLE=$NODEOS_RUN/$tarname"
+    echo "EXPORT_EVIDENCE_ID=$EVIDENCE_ID"
+    echo "bundle: $NODEOS_RUN/$tarname"
+    if [ -n "${1:-}" ]; then
+        mkdir -p "$1"
+        cp "$NODEOS_RUN/$tarname" "$1/$tarname"
+        sync 2>/dev/null || true
+        echo "copied to: $1/$tarname"
+    fi
+    ip=${NODEOS_IPV4_CIDR:-192.168.77.2/30}; ip=${ip%%/*}
+    echo "fetch from the workstation:"
+    echo "  scp -i <key> root@$ip:$NODEOS_RUN/$tarname ."
+    echo "verify (workstation): python tools/verify-evidence.py $tarname"
+}
+
+do_verify() {
+    [ -d "${1:-}" ] || { echo "usage: nodeos-evidence verify DIR" >&2; exit 2; }
+    (cd "$1" && sha256sum -c SHA256SUMS)
+}
+
+case "$cmd" in
+    collect) do_collect "${1:-}" ;;
+    export) do_export "${1:-}" ;;
+    verify) do_verify "${1:-}" ;;
+    *) echo "usage: nodeos-evidence {collect [--refresh|--auto]|export [DEST]|verify DIR}" >&2; exit 2 ;;
+esac

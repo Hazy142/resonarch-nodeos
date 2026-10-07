@@ -32,10 +32,15 @@ int main() {
     rc = cudaMemcpy(&host, device, sizeof(host), cudaMemcpyDeviceToHost);
     if (rc != cudaSuccess) fail("cudaMemcpy", rc);
     cudaFree(device);
+    int runtime_version = 0, driver_version = 0;
+    cudaRuntimeGetVersion(&runtime_version);
+    cudaDriverGetVersion(&driver_version);
     const bool pass = host == 0x4e4f4445u;
     std::printf(
         "{\"schema\":\"resonarch.nodeos.cuda-smoke.v1\",\"status\":\"%s\","
-        "\"device\":\"%s\",\"compute_capability\":\"%d.%d\",\"word\":\"0x%08x\"}\n",
-        pass ? "PASS" : "FAIL", prop.name, prop.major, prop.minor, host);
+        "\"device\":\"%s\",\"compute_capability\":\"%d.%d\",\"word\":\"0x%08x\","
+        "\"runtime_version\":%d,\"driver_version\":%d}\n",
+        pass ? "PASS" : "FAIL", prop.name, prop.major, prop.minor, host,
+        runtime_version, driver_version);
     return pass ? 0 : 1;
 }

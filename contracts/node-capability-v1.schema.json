@@ -7,10 +7,63 @@
   "properties": {
     "schema": { "const": "resonarch.nodeos.capability.v1" },
     "node_id": { "type": "string", "minLength": 1 },
+    "state": {
+      "enum": [
+        "BOOTING", "KERNEL_READY", "NIC_DISCOVERED", "LINK_READY", "GPU_DISCOVERED",
+        "NVIDIA_PAYLOAD_VERIFIED", "DRIVER_READY", "CUDA_PROBE_PASS", "NODE_READY",
+        "FABRIC_READY",
+        "BLOCKED_NO_NIC", "BLOCKED_NO_CARRIER", "BLOCKED_NO_IP", "BLOCKED_GPU_MISSING",
+        "BLOCKED_DRIVER", "BLOCKED_CUDA", "DEGRADED_LINK"
+      ]
+    },
+    "state_reason": { "type": "string" },
+    "stage": { "type": "string" },
+    "verdict": { "enum": ["PASS", "FAIL", "INCOMPLETE"] },
+    "system": {
+      "type": "object",
+      "properties": {
+        "boot_id": { "type": "string" },
+        "uptime_s": { "type": ["integer", "null"] },
+        "uefi": { "type": "boolean" },
+        "profile": { "type": "string" },
+        "nodeos_commit": { "type": "string" },
+        "buildroot_commit": { "type": "string" },
+        "nvidia_payload_sha256": { "type": "string" },
+        "cuda": { "type": "object" }
+      }
+    },
     "cpu": { "type": "object" },
     "memory": { "type": "object" },
-    "network": { "type": "object" },
-    "accelerators": { "type": "array" },
+    "network": {
+      "type": "object",
+      "properties": {
+        "interface": { "type": "string" },
+        "ipv4": { "type": "string" },
+        "mac": { "type": "string" },
+        "driver": { "type": "string" },
+        "speed_mbps": { "type": ["number", "null"] },
+        "duplex": { "type": "string" },
+        "carrier": { "type": ["boolean", "null"] },
+        "mtu": { "type": ["number", "null"] },
+        "rx_errors": { "type": ["number", "null"] },
+        "tx_errors": { "type": ["number", "null"] }
+      }
+    },
+    "accelerators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "uuid": { "type": "string" },
+          "memory_mib": { "type": "object" },
+          "temperature_c": { "type": ["number", "null"] },
+          "clocks_mhz": { "type": "object" },
+          "utilization_pct": { "type": ["number", "null"] },
+          "power_w": { "type": "object" },
+          "pcie": { "type": "object" }
+        }
+      }
+    },
     "runtime_contracts": { "type": "array", "items": { "type": "string" } }
   },
   "additionalProperties": true

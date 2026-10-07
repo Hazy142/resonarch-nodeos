@@ -2,8 +2,11 @@
 set -eu
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
-OUT=/run/nodeos/cuda-smoke.json
-mkdir -p /run/nodeos
+RUN=${NODEOS_RUN:-/run/nodeos}
+ETC=${NODEOS_ETC:-/etc/nodeos}
+PROBE=${NODEOS_CUDA_PROBE:-/usr/libexec/nodeos-cuda-probe}
+OUT=$RUN/cuda-smoke.json
+mkdir -p "$RUN"
 
 fail() {
     reason="$1"
@@ -14,9 +17,9 @@ fail() {
 
 command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi-missing"
 nvidia-smi -L >/dev/null 2>&1 || fail "driver-not-ready"
-[ -x /usr/libexec/nodeos-cuda-probe ] || fail "cuda-probe-missing"
+[ -x "$PROBE" ] || fail "cuda-probe-missing"
 
-if /usr/libexec/nodeos-cuda-probe > "$OUT.tmp" 2>/run/nodeos/cuda-probe.stderr; then
+if "$PROBE" > "$OUT.tmp" 2>"$RUN/cuda-probe.stderr"; then
     mv "$OUT.tmp" "$OUT"
 else
     rm -f "$OUT.tmp"
@@ -24,7 +27,7 @@ else
 fi
 
 grep -q '"status":"PASS"' "$OUT" || fail "cuda-probe-nonpass"
-[ -r /etc/nodeos/nodeos.conf ] && . /etc/nodeos/nodeos.conf
+[ -r "$ETC/nodeos.conf" ] && . "$ETC/nodeos.conf"
 if [ -n "${NODEOS_EXPECTED_CC:-}" ]; then
     grep -Fq "\"compute_capability\":\"$NODEOS_EXPECTED_CC\"" "$OUT" || fail "cuda-capability-mismatch"
 fi
