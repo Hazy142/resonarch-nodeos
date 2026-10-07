@@ -134,6 +134,8 @@ do_export() {
     short=$(printf '%s' "$EVIDENCE_ID" | cut -c1-12)
     tarname="nodeos-evidence-$short.tar"
     tar -cf "$NODEOS_RUN/$tarname" -C "$EVROOT" "$EVIDENCE_BOOT_ID"
+    echo "EXPORT_BUNDLE=$NODEOS_RUN/$tarname"
+    echo "EXPORT_EVIDENCE_ID=$EVIDENCE_ID"
     echo "bundle: $NODEOS_RUN/$tarname"
     if [ -n "${1:-}" ]; then
         mkdir -p "$1"

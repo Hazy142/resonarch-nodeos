@@ -3,85 +3,259 @@
 param(
     [string]$TargetIp = "192.168.77.2",
     [string]$HostIp = "192.168.77.1",
+    [int]$IperfPort = 5201,
     [string]$SshKeyPath = "$HOME\.ssh\id_ed25519",
+    [string]$KnownHostsFile = "",
+    [string]$StrictHostKeyChecking = "accept-new",
     [switch]$StartIperfServer,
     [switch]$FetchEvidence,
-    [string]$OutputDir = ".\evidence-downloads"
+    [string]$ExpectedCc = "6.1",
+    [string]$ExpectedProfile = "haswell-gtx1070ti",
+    [string]$OutputDir = ".\evidence-downloads",
+    [string]$SshCmd = "ssh",
+    [string]$ScpCmd = "scp",
+    [string]$PythonCmd = "python"
 )
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "=== NodeOS Direct-LAN Host Orchestrator ===" -ForegroundColor Cyan
-Write-Host "Target IP: $TargetIp"
-Write-Host "Host IP:   $HostIp"
+function Write-Diag {
+    param([string]$Message)
+    [Console]::Stderr.WriteLine("[DIAG] $Message")
+}
+
+function Test-TcpListener {
+    param([string]$Address, [int]$Port)
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $asyncResult = $client.BeginConnect($Address, $Port, $null, $null)
+        $success = $asyncResult.AsyncWaitHandle.WaitOne(500, $false)
+        if ($client.Connected) { $client.Close() }
+        return $success
+    } catch {
+        return $false
+    }
+}
+
+# Resolve verifier script relative to script directory
+$scriptDir = $PSScriptRoot
+if (!$scriptDir) { $scriptDir = Get-Location }
+$verifierPath = Join-Path $scriptDir "verify-evidence.py"
+
+Write-Diag "=== NodeOS Direct-LAN Host Orchestrator ==="
+Write-Diag "Target IP: $TargetIp"
+Write-Diag "Host IP:   $HostIp"
+
+# 0. Prerequisite Binary & File Checks
+if ($FetchEvidence -or $StartIperfServer) {
+    if (!(Get-Command $SshCmd -ErrorAction SilentlyContinue) -and !(Test-Path $SshCmd)) {
+        Write-Diag "ERROR: Required SSH binary '$SshCmd' not found."
+        exit 1
+    }
+    if ($FetchEvidence) {
+        if (!(Get-Command $ScpCmd -ErrorAction SilentlyContinue) -and !(Test-Path $ScpCmd)) {
+            Write-Diag "ERROR: Required SCP binary '$ScpCmd' not found."
+            exit 1
+        }
+        if (!(Get-Command $PythonCmd -ErrorAction SilentlyContinue) -and !(Test-Path $PythonCmd)) {
+            Write-Diag "ERROR: Required Python binary '$PythonCmd' not found."
+            exit 1
+        }
+        if (!(Test-Path $verifierPath)) {
+            Write-Diag "ERROR: Verifier script not found at '$verifierPath'."
+            exit 1
+        }
+        if (!(Test-Path $SshKeyPath)) {
+            Write-Diag "ERROR: SSH key not found at '$SshKeyPath'."
+            exit 1
+        }
+    }
+}
 
 # 1. ICMP Ping check
-Write-Host "`n[1/4] Checking ICMP reachability to $TargetIp..." -NoNewline
+Write-Diag "[1/4] Checking ICMP reachability to $TargetIp..."
 $ping = Test-Connection -ComputerName $TargetIp -Count 2 -Quiet -ErrorAction SilentlyContinue
 if ($ping) {
-    Write-Host " [OK]" -ForegroundColor Green
+    Write-Diag "ICMP reachability OK."
 } else {
-    Write-Host " [FAILED]" -ForegroundColor Red
-    Write-Warning "Target $TargetIp is not responding to ICMP ping. Verify cable connection & NodeOS link gate."
+    Write-Diag "WARNING: Target $TargetIp is not responding to ICMP ping."
 }
 
-# 2. iperf3 server check
-Write-Host "`n[2/4] Checking local iperf3 server on $HostIp..."
-$iperfProc = Get-Process -Name "iperf3" -ErrorAction SilentlyContinue
-if ($iperfProc) {
-    Write-Host "iperf3 server is running (PID: $($iperfProc.Id))." -ForegroundColor Green
+# 2. iperf3 server listener check
+Write-Diag "[2/4] Checking local iperf3 listener on $HostIp:$IperfPort..."
+$listenerActive = Test-TcpListener -Address $HostIp -Port $IperfPort
+if ($listenerActive) {
+    Write-Diag "iperf3 TCP listener active on $HostIp:$IperfPort."
 } else {
     if ($StartIperfServer) {
-        Write-Host "Starting iperf3 -s background process..." -ForegroundColor Yellow
-        Start-Process -FilePath "iperf3" -ArgumentList "-s" -WindowStyle Hidden
-        Write-Host "iperf3 server started." -ForegroundColor Green
+        Write-Diag "Starting iperf3 server bound to $HostIp:$IperfPort..."
+        if (!(Get-Command "iperf3" -ErrorAction SilentlyContinue)) {
+            Write-Diag "ERROR: 'iperf3' executable not found on host."
+            exit 1
+        }
+        Start-Process -FilePath "iperf3" -ArgumentList "-s", "-B", $HostIp, "-p", $IperfPort -WindowStyle Hidden
+        # Poll for readiness up to 5 seconds
+        $ready = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-TcpListener -Address $HostIp -Port $IperfPort) {
+                $ready = $true
+                break
+            }
+        }
+        if ($ready) {
+            Write-Diag "iperf3 server started and listening on $HostIp:$IperfPort."
+        } else {
+            Write-Diag "ERROR: iperf3 server failed to bind/listen on $HostIp:$IperfPort within 5 seconds."
+            exit 1
+        }
     } else {
-        Write-Host "iperf3 server is NOT running. Run with -StartIperfServer or start 'iperf3 -s' manually." -ForegroundColor Yellow
+        Write-Diag "WARNING: No iperf3 listener active on $HostIp:$IperfPort."
     }
 }
 
-# 3. SSH Connectivity check
-Write-Host "`n[3/4] Checking direct-LAN SSH reachability..."
+# Common SSH options array
+$sshOpts = @("-i", $SshKeyPath, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=$StrictHostKeyChecking", "-o", "ConnectTimeout=5")
+if ($KnownHostsFile) {
+    $sshOpts += @("-o", "UserKnownHostsFile=$KnownHostsFile")
+}
+
+# 3. Direct-LAN SSH console check
+Write-Diag "[3/4] Checking direct-LAN SSH reachability..."
 if (Test-Path $SshKeyPath) {
-    Write-Host "Executing: ssh root@$TargetIp ..." -ForegroundColor Gray
-    try {
-        $sshOutput = & ssh -i "$SshKeyPath" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "root@$TargetIp" "nodeos-console --once" 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "SSH connection SUCCESSFUL!" -ForegroundColor Green
-            Write-Host "`n--- NodeOS Target Console Frame ---" -ForegroundColor DarkGray
-            Write-Host $sshOutput
-            Write-Host "------------------------------------`n" -ForegroundColor DarkGray
-        } else {
-            Write-Host "SSH command returned exit code $LASTEXITCODE" -ForegroundColor Yellow
+    $sshArgs = $sshOpts + @("root@$TargetIp", "nodeos-console", "--once")
+    $sshProcess = Start-Process -FilePath $SshCmd -ArgumentList $sshArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-ssh-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-ssh-err.tmp"
+    $sshProcess.WaitForExit()
+    $sshCode = $sshProcess.ExitCode
+    if ($sshCode -eq 0) {
+        Write-Diag "SSH console probe succeeded."
+        $out = Get-Content "$env:TEMP\nodeos-ssh-out.tmp" -Raw -ErrorAction SilentlyContinue
+        Write-Diag "--- NodeOS Target Console Frame ---"
+        Write-Diag $out
+    } else {
+        $err = Get-Content "$env:TEMP\nodeos-ssh-err.tmp" -Raw -ErrorAction SilentlyContinue
+        Write-Diag "ERROR: SSH console command failed with exit code $sshCode: $err"
+        if (!$FetchEvidence) {
+            exit $sshCode
         }
-    } catch {
-        Write-Host "SSH connection failed: $_" -ForegroundColor Red
     }
-} else {
-    Write-Host "SSH key not found at $SshKeyPath. Skipping SSH probe." -ForegroundColor Yellow
 }
 
 # 4. Evidence Download & Verification
 if ($FetchEvidence) {
-    Write-Host "`n[4/4] Exporting and fetching NodeOS evidence bundle..."
-    if (!(Test-Path $OutputDir)) {
-        New-Item -ItemType Directory -Path $OutputDir | Out-Null
+    Write-Diag "[4/4] Exporting and fetching NodeOS evidence bundle..."
+
+    # Run evidence export on target
+    $exportArgs = $sshOpts + @("root@$TargetIp", "nodeos-evidence", "export")
+    $expProc = Start-Process -FilePath $SshCmd -ArgumentList $exportArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-export-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-export-err.tmp"
+    $expProc.WaitForExit()
+    $expCode = $expProc.ExitCode
+    $expOut = Get-Content "$env:TEMP\nodeos-export-out.tmp" -Raw -ErrorAction SilentlyContinue
+    $expErr = Get-Content "$env:TEMP\nodeos-export-err.tmp" -Raw -ErrorAction SilentlyContinue
+
+    if ($expCode -ne 0) {
+        Write-Diag "ERROR: nodeos-evidence export failed with exit code $expCode: $expErr"
+        exit $expCode
     }
-    
-    Write-Host "Triggering evidence export on target..." -ForegroundColor Gray
-    $expOut = & ssh -i "$SshKeyPath" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "root@$TargetIp" "nodeos-evidence export" 2>&1
-    
-    Write-Host "Fetching evidence tarball via SCP..." -ForegroundColor Gray
-    & scp -i "$SshKeyPath" -o StrictHostKeyChecking=no "root@${TargetIp}:/run/nodeos/nodeos-evidence-*.tar" "$OutputDir\"
-    
-    $downloaded = Get-ChildItem -Path $OutputDir -Filter "nodeos-evidence-*.tar" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($downloaded) {
-        Write-Host "Downloaded: $($downloaded.FullName)" -ForegroundColor Green
-        Write-Host "Running host verification tool (verify-evidence.py)..." -ForegroundColor Cyan
-        python tools/verify-evidence.py "$($downloaded.FullName)"
-    } else {
-        Write-Host "No evidence tarball downloaded." -ForegroundColor Red
+
+    # Parse EXPORT_BUNDLE and EXPORT_EVIDENCE_ID
+    $remoteBundle = ""
+    $expectedEvId = ""
+    foreach ($line in ($expOut -split "`r?`n")) {
+        if ($line -match "^EXPORT_BUNDLE=(.+)$") {
+            $remoteBundle = $matches[1].Trim()
+        }
+        if ($line -match "^EXPORT_EVIDENCE_ID=(.+)$") {
+            $expectedEvId = $matches[1].Trim()
+        }
     }
+
+    if (!$remoteBundle) {
+        # Fallback parsing for bundle: <path>
+        foreach ($line in ($expOut -split "`r?`n")) {
+            if ($line -match "^bundle:\s*(.+)$") {
+                $remoteBundle = $matches[1].Trim()
+            }
+        }
+    }
+
+    if (!$remoteBundle) {
+        Write-Diag "ERROR: Could not parse remote export bundle path from export output: $expOut"
+        exit 1
+    }
+
+    # Validate remote path to prevent shell injection / ambiguous downloads
+    if ($remoteBundle -match "[;&|<>`$]") {
+        Write-Diag "ERROR: Remote bundle path contains invalid characters: $remoteBundle"
+        exit 1
+    }
+    if ($remoteBundle !match "^/run/nodeos/nodeos-evidence-[a-f0-9]+\.tar$" -and $remoteBundle !match "^/var/lib/nodeos/evidence/.*\.tar$") {
+        Write-Diag "ERROR: Remote bundle path does not match expected pattern: $remoteBundle"
+        exit 1
+    }
+
+    # Create brand-new, isolated local download subdirectory
+    $timestamp = (Get-Date).ToString("yyyyMMdd-HHmmss-fff")
+    $runSubdir = Join-Path $OutputDir "download-$timestamp"
+    New-Item -ItemType Directory -Path $runSubdir -Force | Out-Null
+
+    Write-Diag "Fetching remote bundle '$remoteBundle' into isolated directory '$runSubdir'..."
+    $scpArgs = $sshOpts + @("root@${TargetIp}:${remoteBundle}", "$runSubdir\")
+    $scpProc = Start-Process -FilePath $ScpCmd -ArgumentList $scpArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-scp-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-scp-err.tmp"
+    $scpProc.WaitForExit()
+    $scpCode = $scpProc.ExitCode
+    if ($scpCode -ne 0) {
+        $scpErr = Get-Content "$env:TEMP\nodeos-scp-err.tmp" -Raw -ErrorAction SilentlyContinue
+        Write-Diag "ERROR: SCP transfer failed with exit code $scpCode: $scpErr"
+        exit $scpCode
+    }
+
+    # Find downloaded file in the isolated subfolder
+    $downloadedFiles = @(Get-ChildItem -Path $runSubdir -Filter "*.tar")
+    if ($downloadedFiles.Count -ne 1) {
+        Write-Diag "ERROR: Expected exactly 1 tarball in $runSubdir, found $($downloadedFiles.Count)."
+        exit 1
+    }
+
+    $tarFile = $downloadedFiles[0]
+    if ($tarFile.Length -eq 0) {
+        Write-Diag "ERROR: Downloaded evidence tarball is 0 bytes: $($tarFile.FullName)"
+        exit 1
+    }
+
+    Write-Diag "Running host verifier (verify-evidence.py) on $($tarFile.FullName)..."
+    $pyArgs = @($verifierPath, $tarFile.FullName)
+    if ($ExpectedCc) { $pyArgs += @("--expected-cc", $ExpectedCc) }
+    if ($ExpectedProfile) { $pyArgs += @("--expected-profile", $ExpectedProfile) }
+
+    $pyProc = Start-Process -FilePath $PythonCmd -ArgumentList $pyArgs -NoNewWindow -PassThru -RedirectStandardOutput "$env:TEMP\nodeos-verify-out.tmp" -RedirectStandardError "$env:TEMP\nodeos-verify-err.tmp"
+    $pyProc.WaitForExit()
+    $pyCode = $pyProc.ExitCode
+    $pyOut = Get-Content "$env:TEMP\nodeos-verify-out.tmp" -Raw -ErrorAction SilentlyContinue
+    $pyErr = Get-Content "$env:TEMP\nodeos-verify-out.tmp" -Raw -ErrorAction SilentlyContinue
+
+    Write-Diag $pyOut
+    if ($pyCode -ne 0) {
+        Write-Diag "ERROR: Host verifier rejected evidence bundle with exit code $pyCode."
+        exit $pyCode
+    }
+
+    # Extract verified Evidence ID from output and compare to expectedEvId if available
+    $verifiedEvId = ""
+    foreach ($line in ($pyOut -split "`r?`n")) {
+        if ($line -match "^Evidence ID:\s*([a-f0-9]{64})$") {
+            $verifiedEvId = $matches[1].Trim()
+        }
+    }
+
+    if ($expectedEvId -and $verifiedEvId -and $expectedEvId -ne $verifiedEvId) {
+        Write-Diag "ERROR: Evidence ID mismatch: export claimed '$expectedEvId', verified bundle is '$verifiedEvId'."
+        exit 1
+    }
+
+    Write-Diag "Evidence verification SUCCESSFUL! ID: $verifiedEvId"
+    # Print clean machine-readable success line on stdout
+    Write-Output "SUCCESS EVIDENCE_ID=$verifiedEvId FILE=$($tarFile.FullName)"
 }
 
-Write-Host "`nOrchestration check complete." -ForegroundColor Cyan
+exit 0

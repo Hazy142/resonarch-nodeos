@@ -53,6 +53,12 @@ load_status() {
 }
 
 render_compact() {
+    if [ "${STATUS_OK:-0}" != 1 ]; then
+        title "resonArch NodeOS / NODEOS-001-LAB"
+        row1 "waiting for nodeos-agent (no $NODEOS_RUN/status.env yet)"
+        rule1
+        return 0
+    fi
     _ram=$(awk -v k="${MEM_KIB:-0}" 'BEGIN{printf "%.1f GiB", k/1048576}')
     _gname=${GPU_NAME:-$GPU_LSPCI_NAME}
     _commit=$(printf '%s' "${NODEOS_BUILD_COMMIT:-unknown}" | cut -c1-7)
@@ -92,6 +98,12 @@ render_compact() {
 }
 
 render_full() {
+    if [ "${STATUS_OK:-0}" != 1 ]; then
+        title "resonArch NodeOS / NODEOS-001-LAB"
+        row1 "waiting for nodeos-agent (no $NODEOS_RUN/status.env yet)"
+        rule1
+        return 0
+    fi
     _ram=$(awk -v k="${MEM_KIB:-0}" 'BEGIN{printf "%.1f GiB", k/1048576}')
     _gname=${GPU_NAME:-$GPU_LSPCI_NAME}
     _commit=$(printf '%s' "${NODEOS_BUILD_COMMIT:-unknown}" | cut -c1-7)
@@ -243,11 +255,31 @@ act_shell() {
     printf '%s[?25l' "$ESC"
 }
 
-if [ "$PLAIN" = 1 ]; then
-    load_status
-    render_full
-    exit 0
+case "${1:-}" in
+    --once|--full)
+        load_status
+        render_full
+        exit 0
+        ;;
+    --compact)
+        load_status
+        render_compact
+        exit 0
+        ;;
+    --lib-only)
+        return 0 2>/dev/null || exit 0
+        ;;
+esac
+
+if [ "${NODEOS_CONSOLE_LIB_ONLY:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
 fi
+
+# Guard against top-level execution when sourced in tests or helper scripts
+case "${0##*/}" in
+    nodeos-console|nodeos-console-export) ;;
+    *) return 0 2>/dev/null || exit 0 ;;
+esac
 
 printf '%s[?25l' "$ESC"
 screen_clear

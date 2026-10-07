@@ -70,6 +70,29 @@ gpu_query() {
     return 0
 }
 
+# Theoretical usable link bandwidth per lane in MB/s (accounting for encoding overhead):
+#   Gen 1 (2.5 GT/s,  8b/10b) = 250 MB/s per lane
+#   Gen 2 (5.0 GT/s,  8b/10b) = 500 MB/s per lane
+#   Gen 3 (8.0 GT/s, 128b/130b) = 985 MB/s per lane
+#   Gen 4 (16.0 GT/s, 128b/130b) = 1969 MB/s per lane
+#   Gen 5 (32.0 GT/s, 128b/130b) = 3938 MB/s per lane
+#   Gen 6 (64.0 GT/s, 242B/256B) = 7680 MB/s per lane
+pcie_lane_mbps() {
+    case "${1:-}" in
+        1) echo 250 ;; 2) echo 500 ;; 3) echo 985 ;;
+        4) echo 1969 ;; 5) echo 3938 ;; 6) echo 7680 ;;
+        *) echo 0 ;;
+    esac
+}
+
+pcie_link_capacity_mbps() { # gen width -> total theoretical capacity MB/s
+    _g=$(num_or_empty "${1:-}")
+    _w=$(num_or_empty "${2:-}")
+    [ -n "$_g" ] && [ -n "$_w" ] || { echo 0; return 0; }
+    _per_lane=$(pcie_lane_mbps "$_g")
+    echo $((_per_lane * _w))
+}
+
 pcie_collect() {
     PCIE_CUR_SPEED=""; PCIE_MAX_SPEED=""
     PCIE_CUR_GEN=""; PCIE_CUR_WIDTH=""; PCIE_MAX_GEN=""; PCIE_MAX_WIDTH=""
@@ -87,19 +110,26 @@ pcie_collect() {
         [ -z "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ] || PCIE_SOURCE=nvidia-smi
     fi
     # Idle GPUs legitimately downtrain; remember the best observed link pair (gen, width) seen this boot.
+    # Evaluation uses theoretical link capacity (per-lane MB/s * width); tie-break prefers higher generation.
     _bf="$NODEOS_RUN/pcie-best.env"
     BEST_GEN=""; BEST_WIDTH=""
-    if [ -r "$_bf" ]; then . "$_bf"; fi
+    if [ -r "$_bf" ]; then
+        . "$_bf" 2>/dev/null || true
+        BEST_GEN=$(num_or_empty "${BEST_GEN:-}")
+        BEST_WIDTH=$(num_or_empty "${BEST_WIDTH:-}")
+    fi
     if [ -n "${PCIE_CUR_GEN:-}" ] && [ -n "${PCIE_CUR_WIDTH:-}" ]; then
-        _cur_score=$((PCIE_CUR_GEN * PCIE_CUR_WIDTH))
-        _best_score=0
+        _cur_cap=$(pcie_link_capacity_mbps "$PCIE_CUR_GEN" "$PCIE_CUR_WIDTH")
+        _best_cap=0
         if [ -n "${BEST_GEN:-}" ] && [ -n "${BEST_WIDTH:-}" ]; then
-            _best_score=$((BEST_GEN * BEST_WIDTH))
+            _best_cap=$(pcie_link_capacity_mbps "$BEST_GEN" "$BEST_WIDTH")
         fi
-        if [ "$_cur_score" -gt "$_best_score" ] || \
-           { [ "$_cur_score" -eq "$_best_score" ] && [ "$PCIE_CUR_GEN" -gt "${BEST_GEN:-0}" ]; }; then
-            BEST_GEN=$PCIE_CUR_GEN
-            BEST_WIDTH=$PCIE_CUR_WIDTH
+        if [ "$_cur_cap" -gt 0 ]; then
+            if [ "$_cur_cap" -gt "$_best_cap" ] || \
+               { [ "$_cur_cap" -eq "$_best_cap" ] && [ "$PCIE_CUR_GEN" -gt "${BEST_GEN:-0}" ]; }; then
+                BEST_GEN=$PCIE_CUR_GEN
+                BEST_WIDTH=$PCIE_CUR_WIDTH
+            fi
         fi
     fi
     printf 'BEST_GEN=%s\nBEST_WIDTH=%s\n' "$(sq "${BEST_GEN:-}")" "$(sq "${BEST_WIDTH:-}")" >"$_bf.$$"
