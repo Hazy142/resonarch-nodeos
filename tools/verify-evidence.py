@@ -367,6 +367,37 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
     return not problems, problems, manifest
 
 
+def extract_evidence_tar(target: Path, extraction_root: Path) -> None:
+    """Validate and extract an evidence tarball into a caller-controlled root."""
+    if sys.version_info < (3, 12):
+        raise RuntimeError("Python 3.12+ required for safe tar extraction (filter='data')")
+
+    with tarfile.open(target) as archive:
+        members = archive.getmembers()
+        if len(members) > 50:
+            raise ValueError(f"archive has too many members ({len(members)} > 50)")
+
+        total_size = 0
+        normalized_paths = set()
+        for member in members:
+            if not member.isfile() and not member.isdir():
+                raise ValueError(f"unsafe member type (not a file or dir): {member.name}")
+            if member.name.startswith("/") or ".." in Path(member.name).parts:
+                raise ValueError(f"unsafe tar member path: {member.name}")
+            if member.size > 10 * 1024 * 1024:
+                raise ValueError(f"member too large ({member.size} bytes > 10MB): {member.name}")
+            norm = tuple(Path(member.name).parts)
+            if norm in normalized_paths:
+                raise ValueError(f"duplicate member path: {member.name}")
+            normalized_paths.add(norm)
+            total_size += member.size
+
+        if total_size > 50 * 1024 * 1024:
+            raise ValueError("archive uncompressed size too large (>50MB)")
+
+        archive.extractall(extraction_root, filter="data")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Verify a NodeOS evidence bundle")
     parser.add_argument("target", help="Tarball or directory path")
@@ -382,33 +413,7 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         if target.is_file():
             try:
-                if sys.version_info < (3, 12):
-                    print("PROBLEM: Python 3.12+ required for safe tar extraction (filter='data')")
-                    return 1
-                with tarfile.open(target) as archive:
-                    members = archive.getmembers()
-                    if len(members) > 50:
-                        raise ValueError(f"archive has too many members ({len(members)} > 50)")
-                    
-                    total_size = 0
-                    normalized_paths = set()
-                    for member in members:
-                        if not member.isfile() and not member.isdir():
-                            raise ValueError(f"unsafe member type (not a file or dir): {member.name}")
-                        if member.name.startswith("/") or ".." in Path(member.name).parts:
-                            raise ValueError(f"unsafe tar member path: {member.name}")
-                        if member.size > 10 * 1024 * 1024:
-                            raise ValueError(f"member too large ({member.size} bytes > 10MB): {member.name}")
-                        norm = tuple(Path(member.name).parts)
-                        if norm in normalized_paths:
-                            raise ValueError(f"duplicate member path: {member.name}")
-                        normalized_paths.add(norm)
-                        total_size += member.size
-
-                    if total_size > 50 * 1024 * 1024:
-                        raise ValueError(f"archive uncompressed size too large (>50MB)")
-
-                    archive.extractall(tmp, filter="data")
+                extract_evidence_tar(target, Path(tmp))
             except Exception as e:
                 print(f"PROBLEM: invalid archive: {e}")
                 return 1

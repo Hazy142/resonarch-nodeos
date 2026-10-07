@@ -7,6 +7,7 @@ state is exercised without hardware. Skipped when no POSIX sh is available.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -641,6 +642,8 @@ class EvidenceTests(LabTestBase):
 class HostVerifyEvidenceTests(unittest.TestCase):
     def make_bundle(self, tmp: Path) -> Path:
         bundle = tmp / "evidence/1a2b3c4d-1111-2222-3333-444455556666"
+        if bundle.exists():
+            shutil.rmtree(bundle)
         bundle.mkdir(parents=True, exist_ok=True)
         (bundle / "manifest.json").write_text(json.dumps({
             "schema": "resonarch.nodeos.evidence-manifest.v1",
@@ -741,11 +744,26 @@ class HostVerifyEvidenceTests(unittest.TestCase):
             info.size = 2
             tar.addfile(info, io.BytesIO(b"{}"))
             
-        verifier = [sys.executable, str(ROOT / "tools/verify-evidence.py")]
+        verifier_path = ROOT / "tools/verify-evidence.py"
+        verifier = [sys.executable, str(verifier_path)]
         proc = subprocess.run(verifier + [str(unsafe_tar)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("unsafe tar member path", proc.stdout)
-        self.assertFalse(escape_target.exists(), "Tarball extraction escaped its root directory!")
+
+        # Exercise the extraction step against a caller-controlled root.  This
+        # makes the non-write assertion refer to the actual extraction root,
+        # rather than the verifier subprocess's unrelated TemporaryDirectory.
+        extraction_root = tmp / "extract-root"
+        extraction_root.mkdir()
+        spec = importlib.util.spec_from_file_location("nodeos_verify_evidence", verifier_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        verifier_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier_module)
+        with self.assertRaisesRegex(ValueError, "unsafe tar member path"):
+            verifier_module.extract_evidence_tar(unsafe_tar, extraction_root)
+        self.assertFalse(escape_target.exists(), "Tarball extraction escaped its controlled root directory!")
+        self.assertEqual(list(extraction_root.iterdir()), [], "Rejected archive wrote inside the extraction root")
         
         dup_tar = tmp / "dup.tar"
         with tarfile.open(dup_tar, "w") as tar:
@@ -908,7 +926,7 @@ class HostPowerShellTests(unittest.TestCase):
 
         if sys.platform == "win32":
             ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
-            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('mock tar content')\" %*\nexit /b 0\n")
+            scp_mock.write_text("@echo off\n:findlast\nif \"%~2\"==\"\" goto gotlast\nshift\ngoto findlast\n:gotlast\n> \"%~1\\nodeos-evidence-123.tar\" echo mock tar content\nexit /b 0\n")
             python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
@@ -959,7 +977,7 @@ class HostPowerShellTests(unittest.TestCase):
 
         # Test 5: Verifier returns non-zero exit code
         if sys.platform == "win32":
-            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('mock tar content')\" %*\nexit /b 0\n")
+            scp_mock.write_text("@echo off\n:findlast\nif \"%~2\"==\"\" goto gotlast\nshift\ngoto findlast\n:gotlast\n> \"%~1\\nodeos-evidence-123.tar\" echo mock tar content\nexit /b 0\n")
             python_mock.write_text("@echo off\nexit /b 1\n")
         else:
             scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
@@ -991,7 +1009,7 @@ class HostPowerShellTests(unittest.TestCase):
         # Test 8: Empty download file
         if sys.platform == "win32":
             ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
-            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('')\" %*\nexit /b 0\n")
+            scp_mock.write_text("@echo off\n:findlast\nif \"%~2\"==\"\" goto gotlast\nshift\ngoto findlast\n:gotlast\ntype nul > \"%~1\\nodeos-evidence-123.tar\"\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
             scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\ntouch \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
@@ -1015,7 +1033,7 @@ class HostPowerShellTests(unittest.TestCase):
         # Test 10: Duplicate Verifier ID
         if sys.platform == "win32":
             ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
-            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('mock tar content')\" %*\nexit /b 0\n")
+            scp_mock.write_text("@echo off\n:findlast\nif \"%~2\"==\"\" goto gotlast\nshift\ngoto findlast\n:gotlast\n> \"%~1\\nodeos-evidence-123.tar\" echo mock tar content\nexit /b 0\n")
             python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666\\nEvidence ID: 2222333344445555666677778888999900001111222233334444555566667777')\"\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")

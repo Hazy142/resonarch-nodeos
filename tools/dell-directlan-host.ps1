@@ -19,6 +19,15 @@ param(
 )
 
 $runId = [guid]::NewGuid().ToString().Substring(0,8)
+$tempRoot = [System.IO.Path]::GetTempPath()
+$sshOutPath = Join-Path $tempRoot "nodeos-ssh-$runId-out.tmp"
+$sshErrPath = Join-Path $tempRoot "nodeos-ssh-$runId-err.tmp"
+$exportOutPath = Join-Path $tempRoot "nodeos-export-$runId-out.tmp"
+$exportErrPath = Join-Path $tempRoot "nodeos-export-$runId-err.tmp"
+$scpOutPath = Join-Path $tempRoot "nodeos-scp-$runId-out.tmp"
+$scpErrPath = Join-Path $tempRoot "nodeos-scp-$runId-err.tmp"
+$verifyOutPath = Join-Path $tempRoot "nodeos-verify-$runId-out.tmp"
+$verifyErrPath = Join-Path $tempRoot "nodeos-verify-$runId-err.tmp"
 
 $ErrorActionPreference = "Stop"
 
@@ -137,15 +146,15 @@ if ($KnownHostsFile) {
 Write-Diag "[3/4] Checking direct-LAN SSH reachability..."
 if (Test-Path $SshKeyPath) {
     $sshArgs = $sshOpts + @("root@$TargetIp", "nodeos-console", "--once")
-    & $SshCmd $sshArgs > "$env:TEMP\nodeos-ssh-$runId-out.tmp" 2> "$env:TEMP\nodeos-ssh-$runId-err.tmp"
+    & $SshCmd $sshArgs > $sshOutPath 2> $sshErrPath
     $sshCode = $LASTEXITCODE
     if ($sshCode -eq 0) {
         Write-Diag "SSH console probe succeeded."
-        $out = Get-Content "$env:TEMP\nodeos-ssh-$runId-out.tmp" -Raw -ErrorAction SilentlyContinue
+        $out = Get-Content $sshOutPath -Raw -ErrorAction SilentlyContinue
         Write-Diag "--- NodeOS Target Console Frame ---"
         Write-Diag $out
     } else {
-        $err = Get-Content "$env:TEMP\nodeos-ssh-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
+        $err = Get-Content $sshErrPath -Raw -ErrorAction SilentlyContinue
         Write-Diag "ERROR: SSH console command failed with exit code ${sshCode}: $err"
         if (!$FetchEvidence) {
             exit $sshCode
@@ -159,10 +168,10 @@ if ($FetchEvidence) {
 
     # Run evidence export on target
     $exportArgs = $sshOpts + @("root@$TargetIp", "nodeos-evidence", "export")
-    & $SshCmd $exportArgs > "$env:TEMP\nodeos-export-$runId-out.tmp" 2> "$env:TEMP\nodeos-export-$runId-err.tmp"
+    & $SshCmd $exportArgs > $exportOutPath 2> $exportErrPath
     $expCode = $LASTEXITCODE
-    $expOut = Get-Content "$env:TEMP\nodeos-export-$runId-out.tmp" -Raw -ErrorAction SilentlyContinue
-    $expErr = Get-Content "$env:TEMP\nodeos-export-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
+    $expOut = Get-Content $exportOutPath -Raw -ErrorAction SilentlyContinue
+    $expErr = Get-Content $exportErrPath -Raw -ErrorAction SilentlyContinue
 
     if ($expCode -ne 0) {
         Write-Diag "ERROR: nodeos-evidence export failed with exit code ${expCode}: $expErr"
@@ -219,10 +228,10 @@ if ($FetchEvidence) {
 
     Write-Diag "Fetching remote bundle '$remoteBundle' into isolated directory '$runSubdir'..."
     $scpArgs = $sshOpts + @("root@${TargetIp}:${remoteBundle}", "$runSubdir\")
-    & $ScpCmd $scpArgs > "$env:TEMP\nodeos-scp-$runId-out.tmp" 2> "$env:TEMP\nodeos-scp-$runId-err.tmp"
+    & $ScpCmd $scpArgs > $scpOutPath 2> $scpErrPath
     $scpCode = $LASTEXITCODE
     if ($scpCode -ne 0) {
-        $scpErr = Get-Content "$env:TEMP\nodeos-scp-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
+        $scpErr = Get-Content $scpErrPath -Raw -ErrorAction SilentlyContinue
         Write-Diag "ERROR: SCP transfer failed with exit code ${scpCode}: $scpErr"
         exit $scpCode
     }
@@ -245,10 +254,10 @@ if ($FetchEvidence) {
     if ($ExpectedCc) { $pyArgs += @("--expected-cc", $ExpectedCc) }
     if ($ExpectedProfile) { $pyArgs += @("--expected-profile", $ExpectedProfile) }
 
-    & $PythonCmd $pyArgs > "$env:TEMP\nodeos-verify-$runId-out.tmp" 2> "$env:TEMP\nodeos-verify-$runId-err.tmp"
+    & $PythonCmd $pyArgs > $verifyOutPath 2> $verifyErrPath
     $pyCode = $LASTEXITCODE
-    $pyOut = Get-Content "$env:TEMP\nodeos-verify-$runId-out.tmp" -Raw -ErrorAction SilentlyContinue
-    $pyErr = Get-Content "$env:TEMP\nodeos-verify-$runId-err.tmp" -Raw -ErrorAction SilentlyContinue
+    $pyOut = Get-Content $verifyOutPath -Raw -ErrorAction SilentlyContinue
+    $pyErr = Get-Content $verifyErrPath -Raw -ErrorAction SilentlyContinue
 
     Write-Diag $pyOut
     if ($pyCode -ne 0) {
