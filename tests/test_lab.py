@@ -930,7 +930,7 @@ class HostPowerShellTests(unittest.TestCase):
             python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
-            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\nfor arg do dest=$arg; done\nprintf '%s\\n' 'mock tar content' > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
             python_mock.write_text("#!/bin/sh\necho 'Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666'\nexit 0\n")
             ssh_mock.chmod(0o755)
             scp_mock.chmod(0o755)
@@ -980,7 +980,7 @@ class HostPowerShellTests(unittest.TestCase):
             scp_mock.write_text("@echo off\n:findlast\nif \"%~2\"==\"\" goto gotlast\nshift\ngoto findlast\n:gotlast\n> \"%~1\\nodeos-evidence-123.tar\" echo mock tar content\nexit /b 0\n")
             python_mock.write_text("@echo off\nexit /b 1\n")
         else:
-            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\nfor arg do dest=$arg; done\nprintf '%s\\n' 'mock tar content' > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
             python_mock.write_text("#!/bin/sh\nexit 1\n")
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
@@ -1012,7 +1012,7 @@ class HostPowerShellTests(unittest.TestCase):
             scp_mock.write_text("@echo off\n:findlast\nif \"%~2\"==\"\" goto gotlast\nshift\ngoto findlast\n:gotlast\ntype nul > \"%~1\\nodeos-evidence-123.tar\"\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
-            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\ntouch \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\nfor arg do dest=$arg; done\ntouch \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
         self.assertIn("ERROR: Downloaded evidence tarball is 0 bytes", proc_fail.stderr)
@@ -1037,7 +1037,7 @@ class HostPowerShellTests(unittest.TestCase):
             python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666\\nEvidence ID: 2222333344445555666677778888999900001111222233334444555566667777')\"\nexit /b 0\n")
         else:
             ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
-            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\nfor arg do dest=$arg; done\nprintf '%s\\n' 'mock tar content' > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
             python_mock.write_text("#!/bin/sh\necho 'Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666\\nEvidence ID: 2222333344445555666677778888999900001111222233334444555566667777'\nexit 0\n")
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
