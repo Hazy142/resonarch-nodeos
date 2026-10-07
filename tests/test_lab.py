@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import io
+import tarfile
 import time
 import unittest
 from pathlib import Path
@@ -636,6 +638,124 @@ class EvidenceTests(LabTestBase):
         self.assertIn("PASS bundle has missing files declared", proc.stdout)
 
 
+class HostVerifyEvidenceTests(unittest.TestCase):
+    def make_bundle(self, tmp: Path) -> Path:
+        bundle = tmp / "evidence/1a2b3c4d-1111-2222-3333-444455556666"
+        bundle.mkdir(parents=True)
+        (bundle / "manifest.json").write_text(json.dumps({
+            "schema": "resonarch.nodeos.evidence-manifest.v1",
+            "node_id": "test-node", "boot_id": "1a2b3c4d",
+            "verdict": "PASS", "state": "NODE_READY", "missing": "",
+            "profile": "haswell-gtx1070ti",
+            "files": []
+        }))
+        (bundle / "cuda-smoke.json").write_text(json.dumps({"status": "PASS", "compute_capability": "6.1"}))
+        (bundle / "capability.json").write_text(json.dumps({
+            "schema": "resonarch.nodeos.capability.v1",
+            "node_id": "test-node",
+            "verdict": "PASS", "state": "NODE_READY",
+            "cpu": {}, "memory": {},
+            "health": {"cuda_smoke": "PASS"},
+            "system": {"cuda": {"compute_capability": "6.1"}},
+            "network": {"interface": "eth0", "ipv4": "192.168.77.2"},
+            "accelerators": [{"uuid": "GPU-123", "pci_address": "0000:01:00.0"}]
+        }))
+        (bundle / "gate-report.json").write_text(json.dumps({
+            "schema": "resonarch.nodeos.gate-report.v1", 
+            "node_id": "test-node", "boot_id": "1a2b3c4d",
+            "verdict": "PASS", "state": "NODE_READY",
+            "gates": [{"name": "gpu", "stage": "GPU_DISCOVERED", "status": "PASS", "blocking": True}]
+        }))
+        (bundle / "network.json").write_text(json.dumps({"link": {"interface": "eth0", "ipv4": "192.168.77.2"}}))
+        (bundle / "pcie.json").write_text(json.dumps({"source": "sysfs", "address": "0000:01:00.0"}))
+        (bundle / "nvidia-smi.txt").write_text("GPU-123")
+        (bundle / "lspci.txt").write_text("")
+        (bundle / "dmesg-tail.txt").write_text("")
+        (bundle / "nodeos-agent.log").write_text("")
+        self._seal(bundle)
+        return bundle
+
+    def _seal(self, bundle: Path):
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        file_map = {}
+        for f in bundle.iterdir():
+            if f.is_file() and f.name not in ("manifest.json", "SHA256SUMS"):
+                b = f.read_bytes()
+                file_map[f.name] = {"name": f.name, "bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()}
+        manifest["files"] = list(file_map.values())
+        (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        sums_lines = []
+        for f in sorted(bundle.iterdir()):
+            if f.is_file() and f.name != "SHA256SUMS":
+                sums_lines.append(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.name}")
+        (bundle / "SHA256SUMS").write_text("\n".join(sums_lines) + "\n")
+
+    def test_verify_evidence_cc_and_profile_rules(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bundle = self.make_bundle(tmp)
+        verifier = [sys.executable, str(ROOT / "tools/verify-evidence.py")]
+        
+        orig_cs = (bundle / "cuda-smoke.json").read_text()
+        
+        def reset_and_check(cs_content: str, args: list[str], expected_in_out: str):
+            (bundle / "cuda-smoke.json").write_text(cs_content)
+            self._seal(bundle)
+            proc = subprocess.run(verifier + args + [str(bundle)], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 1, f"Expected fail for {args}")
+            self.assertIn(expected_in_out, proc.stdout + proc.stderr)
+
+        reset_and_check(orig_cs.replace('"compute_capability": "6.1"', '"compute_capability": ""'), [], "missing or invalid type for compute_capability")
+        reset_and_check(orig_cs.replace('"6.1"', '6.1'), [], "missing or invalid type for compute_capability")
+        reset_and_check(orig_cs, ["--expected-cc", "8.9", "--expected-profile", "haswell-gtx1070ti"], "contradictory expectations")
+        
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        manifest["profile"] = "unknown-profile"
+        (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        reset_and_check(orig_cs, [], "unknown bundle profile: unknown-profile")
+
+    def test_verify_evidence_jsonschema_missing(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bundle = self.make_bundle(tmp)
+        
+        mask_script = tmp / "mask.py"
+        mask_script.write_text(
+            "import sys\n"
+            "sys.modules['jsonschema'] = None\n"
+            f"with open(r'{ROOT}/tools/verify-evidence.py') as f: exec(f.read())\n"
+        )
+        
+        proc = subprocess.run([sys.executable, str(mask_script), str(bundle)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("jsonschema module is missing", proc.stdout)
+
+    def test_verify_evidence_tar_safety(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        
+        unsafe_tar = tmp / "unsafe.tar"
+        with tarfile.open(unsafe_tar, "w") as tar:
+            info = tarfile.TarInfo("../manifest.json")
+            info.size = 2
+            tar.addfile(info, io.BytesIO(b"{}"))
+            
+        verifier = [sys.executable, str(ROOT / "tools/verify-evidence.py")]
+        proc = subprocess.run(verifier + [str(unsafe_tar)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unsafe tar member path", proc.stdout)
+        
+        dup_tar = tmp / "dup.tar"
+        with tarfile.open(dup_tar, "w") as tar:
+            for _ in range(2):
+                info = tarfile.TarInfo("manifest.json")
+                info.size = 2
+                tar.addfile(info, io.BytesIO(b"{}"))
+        proc = subprocess.run(verifier + [str(dup_tar)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("duplicate member path", proc.stdout)
+
+
 @unittest.skipUnless(HAVE_SH, "POSIX sh required")
 class ConsoleTests(LabTestBase):
     def test_frame_shows_gates_hardware_fabric_and_log(self):
@@ -767,7 +887,60 @@ class HostPowerShellTests(unittest.TestCase):
             ssh_mock.write_text("#!/bin/sh\nexit 1\n")
         proc_fail = subprocess.run(cmd, capture_output=True, text=True)
         self.assertNotEqual(proc_fail.returncode, 0)
-        self.assertIn("ERROR: nodeos-evidence export failed with exit code 1", proc_fail.stderr)
+        self.assertIn("ERROR: nodeos-evidence export failed", proc_fail.stderr)
+
+        # Test 4: SCP failure
+        if sys.platform == "win32":
+            ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
+            scp_mock.write_text("@echo off\nexit /b 1\n")
+        else:
+            ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\nexit 1\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: SCP transfer failed", proc_fail.stderr)
+
+        # Test 5: Verifier returns non-zero exit code
+        if sys.platform == "win32":
+            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('mock tar content')\" %*\nexit /b 0\n")
+            python_mock.write_text("@echo off\nexit /b 1\n")
+        else:
+            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\necho mock tar content > \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+            python_mock.write_text("#!/bin/sh\nexit 1\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: Host verifier rejected evidence bundle", proc_fail.stderr)
+
+        # Test 6: Export ID != Verifier ID
+        if sys.platform == "win32":
+            python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: BAD1222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
+        else:
+            python_mock.write_text("#!/bin/sh\necho 'Evidence ID: BAD1222233334444555566667777888899990000111122223333444455556666'\nexit 0\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: Evidence ID mismatch", proc_fail.stderr)
+
+        # Test 7: Missing Export ID
+        if sys.platform == "win32":
+            ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar')\"\nexit /b 0\n")
+            python_mock.write_text(f"@\"{sys.executable}\" -c \"print('Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
+        else:
+            ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\nexit 0\n")
+            python_mock.write_text("#!/bin/sh\necho 'Evidence ID: 1111222233334444555566667777888899990000111122223333444455556666'\nexit 0\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: Export output did not provide EXPORT_EVIDENCE_ID", proc_fail.stderr)
+
+        # Test 8: Empty download file
+        if sys.platform == "win32":
+            ssh_mock.write_text(f"@\"{sys.executable}\" -c \"print('EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\\nEXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666')\"\nexit /b 0\n")
+            scp_mock.write_text(f"@\"{sys.executable}\" -c \"import sys, os; d=sys.argv[-1]; open(os.path.join(d, 'nodeos-evidence-123.tar'), 'w').write('')\" %*\nexit /b 0\n")
+        else:
+            ssh_mock.write_text("#!/bin/sh\necho EXPORT_BUNDLE=/run/nodeos/nodeos-evidence-123.tar\necho EXPORT_EVIDENCE_ID=1111222233334444555566667777888899990000111122223333444455556666\nexit 0\n")
+            scp_mock.write_text("#!/bin/sh\neval dest=\\$$#\ntouch \"$dest/nodeos-evidence-123.tar\"\nexit 0\n")
+        proc_fail = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertIn("ERROR: Downloaded evidence tarball is 0 bytes", proc_fail.stderr)
 
 
 @unittest.skipUnless(HAVE_SH, "POSIX sh required")

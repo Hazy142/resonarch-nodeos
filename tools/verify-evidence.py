@@ -53,12 +53,17 @@ def sha256(path: Path) -> str:
 
 
 def find_bundle_dir(root: Path) -> Path:
+    candidates = []
     if (root / "manifest.json").is_file():
-        return root
-    for child in sorted(root.iterdir()):
+        candidates.append(root)
+    for child in root.iterdir():
         if child.is_dir() and (child / "manifest.json").is_file():
-            return child
-    raise SystemExit("no manifest.json found")
+            candidates.append(child)
+    if not candidates:
+        raise ValueError("no manifest.json found")
+    if len(candidates) > 1:
+        raise ValueError("ambiguous bundle: multiple manifest.json found")
+    return candidates[0]
 
 
 def safe_read_json(path: Path) -> tuple[dict | None, str | None]:
@@ -75,7 +80,7 @@ def safe_read_json(path: Path) -> tuple[dict | None, str | None]:
 
 def validate_schema(data: dict, schema_filename: str) -> str | None:
     if not jsonschema:
-        return None  # Skip if jsonschema is not installed
+        return "jsonschema module is missing. It is required for evidence verification. Please install it (e.g. pip install jsonschema)."
 
     schema_path = Path(__file__).parent.parent / "contracts" / schema_filename
     if not schema_path.is_file():
@@ -176,13 +181,15 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
         if expected_profile not in KNOWN_PROFILES:
             problems.append(f"unknown expected profile: {expected_profile}")
         else:
-            if not target_cc:
-                target_cc = KNOWN_PROFILES.get(expected_profile)
+            profile_cc = KNOWN_PROFILES[expected_profile]
+            if target_cc and target_cc != profile_cc:
+                problems.append(f"contradictory expectations: --expected-cc {target_cc} does not match profile {expected_profile} ({profile_cc})")
+            target_cc = profile_cc
         if prof != expected_profile:
             problems.append(f"profile mismatch: manifest has {prof}, expected {expected_profile}")
     else:
-        if not target_cc:
-            target_cc = KNOWN_PROFILES.get(prof)
+        if not target_cc and prof and prof not in KNOWN_PROFILES:
+            problems.append(f"unknown bundle profile: {prof}")
 
     # Cross-file structural & semantic checks
     if (bundle / "gate-report.json").is_file():
@@ -213,8 +220,11 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
                     problems.append(f"semantic mismatch: capability verdict is {cap.get('verdict')}")
                 if cap.get("state") != "NODE_READY":
                     problems.append(f"semantic mismatch: capability state is {cap.get('state')}")
-                if cap.get("health", {}).get("cuda_smoke") != "PASS":
-                    problems.append(f"semantic mismatch: capability cuda_smoke health is {cap.get('health', {}).get('cuda_smoke')}")
+                health = cap.get("health")
+                if not isinstance(health, dict):
+                    problems.append("semantic mismatch: capability health is not an object")
+                elif health.get("cuda_smoke") != "PASS":
+                    problems.append(f"semantic mismatch: capability cuda_smoke health is {health.get('cuda_smoke')}")
 
             accs = cap.get("accelerators")
             if not isinstance(accs, list) or not accs:
@@ -274,22 +284,32 @@ def verify(bundle: Path, expected_cc: str | None = None, expected_profile: str |
             if verdict == "PASS" and cs.get("status") != "PASS":
                 problems.append(f"semantic mismatch: cuda-smoke status is {cs.get('status')}")
             cuda_cc = cs.get("compute_capability")
-            if cuda_cc and not CC_RE.match(str(cuda_cc)):
+            
+            if verdict == "PASS":
+                if not isinstance(cuda_cc, str) or not cuda_cc.strip():
+                    problems.append("missing or invalid type for compute_capability in cuda-smoke.json")
+                elif not CC_RE.match(cuda_cc):
+                    problems.append(f"invalid CUDA compute capability syntax: {cuda_cc}")
+            elif cuda_cc is None:
+                pass
+            elif not isinstance(cuda_cc, str) or not CC_RE.match(cuda_cc):
                 problems.append(f"invalid CUDA compute capability syntax: {cuda_cc}")
 
-    if cap_data and isinstance(cap_data.get("system"), dict):
-        sys_cuda = cap_data["system"].get("cuda", {})
-        if isinstance(sys_cuda, dict) and sys_cuda.get("compute_capability"):
-            cap_cc = str(sys_cuda.get("compute_capability"))
-            if not CC_RE.match(cap_cc):
-                problems.append(f"invalid capability CUDA compute capability syntax: {cap_cc}")
-            if cuda_cc and cap_cc != str(cuda_cc):
-                problems.append(f"CUDA CC inconsistency: capability ({cap_cc}) != cuda-smoke ({cuda_cc})")
+    if cap_data:
+        sys_info = cap_data.get("system")
+        if isinstance(sys_info, dict):
+            sys_cuda = sys_info.get("cuda")
+            if isinstance(sys_cuda, dict) and "compute_capability" in sys_cuda:
+                cap_cc = sys_cuda.get("compute_capability")
+                if not isinstance(cap_cc, str) or not CC_RE.match(cap_cc):
+                    problems.append(f"invalid capability CUDA compute capability syntax: {cap_cc}")
+                if isinstance(cuda_cc, str) and isinstance(cap_cc, str) and cap_cc != cuda_cc:
+                    problems.append(f"CUDA CC inconsistency: capability ({cap_cc}) != cuda-smoke ({cuda_cc})")
 
-    if target_cc and verdict == "PASS":
-        if not cuda_cc:
-            problems.append(f"compute capability missing, expected {target_cc}")
-        elif str(cuda_cc) != str(target_cc):
+    if verdict == "PASS":
+        if not isinstance(cuda_cc, str) or not cuda_cc.strip():
+            problems.append("measured compute capability missing or invalid for PASS verdict")
+        elif target_cc and cuda_cc != target_cc:
             problems.append(f"compute capability mismatch: measured {cuda_cc} != expected {target_cc}")
 
     if (bundle / "pcie.json").is_file():
@@ -325,20 +345,47 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         if target.is_file():
             try:
+                if sys.version_info < (3, 12):
+                    print("PROBLEM: Python 3.12+ required for safe tar extraction (filter='data')")
+                    return 1
                 with tarfile.open(target) as archive:
-                    for member in archive.getmembers():
-                        if member.name.startswith("/") or ".." in member.name:
-                            raise ValueError(f"unsafe tar member: {member.name}")
-                    if sys.version_info >= (3, 12):
-                        archive.extractall(tmp, filter="data")
-                    else:
-                        archive.extractall(tmp)
+                    members = archive.getmembers()
+                    if len(members) > 50:
+                        raise ValueError(f"archive has too many members ({len(members)} > 50)")
+                    
+                    total_size = 0
+                    normalized_paths = set()
+                    for member in members:
+                        if not member.isfile() and not member.isdir():
+                            raise ValueError(f"unsafe member type (not a file or dir): {member.name}")
+                        if member.name.startswith("/") or ".." in Path(member.name).parts:
+                            raise ValueError(f"unsafe tar member path: {member.name}")
+                        if member.size > 10 * 1024 * 1024:
+                            raise ValueError(f"member too large ({member.size} bytes > 10MB): {member.name}")
+                        norm = tuple(Path(member.name).parts)
+                        if norm in normalized_paths:
+                            raise ValueError(f"duplicate member path: {member.name}")
+                        normalized_paths.add(norm)
+                        total_size += member.size
+
+                    if total_size > 50 * 1024 * 1024:
+                        raise ValueError(f"archive uncompressed size too large (>50MB)")
+
+                    archive.extractall(tmp, filter="data")
             except Exception as e:
                 print(f"PROBLEM: invalid archive: {e}")
                 return 1
-            bundle = find_bundle_dir(Path(tmp))
+            try:
+                bundle = find_bundle_dir(Path(tmp))
+            except Exception as e:
+                print(f"PROBLEM: archive content error: {e}")
+                return 1
         else:
-            bundle = find_bundle_dir(target)
+            try:
+                bundle = find_bundle_dir(target)
+            except Exception as e:
+                print(f"PROBLEM: directory verification failed: {e}")
+                return 1
 
         ok, problems, manifest = verify(bundle, expected_cc=args.expected_cc, expected_profile=args.expected_profile)
         evidence_id = sha256(bundle / "manifest.json")
