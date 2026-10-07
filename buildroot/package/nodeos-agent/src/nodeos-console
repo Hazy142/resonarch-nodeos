@@ -52,14 +52,46 @@ load_status() {
     return 0
 }
 
-render() {
-    load_status
-    if [ "$STATUS_OK" != 1 ]; then
-        title "resonArch NodeOS / NODEOS-001-LAB"
-        row1 "waiting for nodeos-agent (no $NODEOS_RUN/status.env yet)"
-        rule1
-        return 0
+render_compact() {
+    _ram=$(awk -v k="${MEM_KIB:-0}" 'BEGIN{printf "%.1f GiB", k/1048576}')
+    _gname=${GPU_NAME:-$GPU_LSPCI_NAME}
+    _commit=$(printf '%s' "${NODEOS_BUILD_COMMIT:-unknown}" | cut -c1-7)
+    _boot=$(printf '%s' "${BOOT_ID:-}" | cut -c1-8)
+    _pcie="n/a"
+    if [ -n "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ]; then
+        _pcie="Gen${PCIE_CUR_GEN:-?} x${PCIE_CUR_WIDTH:-?}"
     fi
+    _nr=WARN; [ "$STATE" != NODE_READY ] || _nr=PASS
+    case "$STATE" in BLOCKED_*|BOOTING) _nr=FAIL ;; esac
+
+    title "resonArch NodeOS / NODEOS-001-LAB (Compact)"
+    row1 "node: $NODE_ID  uptime: $(fmt_uptime "$UPTIME_S")  build: $_commit  profile: ${NODEOS_BUILD_PROFILE:-unknown}"
+    rule2
+    row2 "SYSTEM STATE & VERDICT" "HARDWARE & FABRIC"
+    row2 "STATE $STATE" "CPU   $(or_na "$CPU_MODEL")"
+    row2 "REASON ${STATE_REASON:-none}" "RAM   $_ram (${CPU_LOGICAL:-?} th)  GPU $(or_na "$_gname")"
+    row2 "VERDICT $VERDICT" "PCIe  $_pcie (best Gen$(or_na "$PCIE_BEST_GEN") x$(or_na "$PCIE_BEST_WIDTH"))"
+    row2 "$(mark "$_nr") NODE_READY" "VRAM  $(or_na "$GPU_MEM_USED") / $(or_na "$GPU_MEM_TOTAL") MiB  Temp $(or_na "$GPU_TEMP") C"
+    row2 "$(mark "$GATE_cuda") CUDA probe ($(or_na "$GATE_cuda_DETAIL"))" "Power $(or_na "$GPU_POWER") / $(or_na "$GPU_POWER_LIMIT") W  Drv $(or_na "$DRIVER")"
+    row2 "$(mark "$GATE_payload") NVIDIA Payload verified" "LAN   $(or_na "$NET_IFACE") $(or_na "$NET_IPV4")"
+    row2 "$(mark "$GATE_driver") Driver ready" "Peer  ${NODEOS_PEER_IPV4:-none} rtt=$(or_na "$NG_RTT") ms"
+    row2 "$(mark "$GATE_link") Link ready" "Perf  $(or_na "$NG_IPERF_MBIT") Mbit/s loss=$(or_na "$NG_LOSS")%"
+    rule1
+    row1 "LIVE LOG"
+    if [ -r "$NODEOS_LOG" ]; then
+        tail -n 3 "$NODEOS_LOG" | while IFS= read -r _line; do row1 "$_line"; done
+    fi
+    rule1
+    _ev="evidence: none yet"
+    if [ -r "$NODEOS_RUN/evidence/latest.env" ]; then
+        ( . "$NODEOS_RUN/evidence/latest.env"; printf 'evidence: %s %s' "$(printf '%s' "$EVIDENCE_ID" | cut -c1-16)" "$EVIDENCE_VERDICT" ) >"$NODEOS_RUN/.console.ev" 2>/dev/null &&
+            _ev=$(cat "$NODEOS_RUN/.console.ev")
+    fi
+    row1 "${MSG:-$_ev}"
+    row1 "[R] rerun gates [N] iperf [D] diagnostics [E] export evidence [L] log [S] shell"
+}
+
+render_full() {
     _ram=$(awk -v k="${MEM_KIB:-0}" 'BEGIN{printf "%.1f GiB", k/1048576}')
     _gname=${GPU_NAME:-$GPU_LSPCI_NAME}
     _commit=$(printf '%s' "${NODEOS_BUILD_COMMIT:-unknown}" | cut -c1-7)
@@ -113,6 +145,23 @@ render() {
     fi
     row1 "${MSG:-$_ev}"
     row1 "[R] rerun gates [N] iperf [D] diagnostics [E] export evidence [L] log [S] shell"
+}
+
+render() {
+    load_status
+    if [ "$STATUS_OK" != 1 ]; then
+        title "resonArch NodeOS / NODEOS-001-LAB"
+        row1 "waiting for nodeos-agent (no $NODEOS_RUN/status.env yet)"
+        rule1
+        return 0
+    fi
+    _rows=$(stty size 2>/dev/null | cut -d' ' -f1)
+    case "$_rows" in ''|*[!0-9]*) _rows=25 ;; esac
+    if [ "$_rows" -lt 35 ]; then
+        render_compact
+    else
+        render_full
+    fi
 }
 
 colorize() {
@@ -195,7 +244,8 @@ act_shell() {
 }
 
 if [ "$PLAIN" = 1 ]; then
-    render
+    load_status
+    render_full
     exit 0
 fi
 

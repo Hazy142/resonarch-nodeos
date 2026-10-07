@@ -19,7 +19,7 @@ from pathlib import Path
 
 REQUIRED = [
     "manifest.json", "capability.json", "gate-report.json", "network.json",
-    "pcie.json", "nvidia-smi.txt", "lspci.txt", "dmesg-tail.txt",
+    "pcie.json", "cuda-smoke.json", "nvidia-smi.txt", "lspci.txt", "dmesg-tail.txt",
     "nodeos-agent.log", "SHA256SUMS",
 ]
 
@@ -42,10 +42,21 @@ def verify(bundle: Path) -> tuple[bool, list[str], dict]:
     manifest = json.loads((bundle / "manifest.json").read_text())
     if manifest.get("schema") != "resonarch.nodeos.evidence-manifest.v1":
         problems.append("unexpected manifest schema")
+    
+    verdict = manifest.get("verdict")
+    state = manifest.get("state")
     missing = manifest.get("missing") or ""
+
+    if verdict == "PASS":
+        if missing:
+            problems.append(f"PASS bundle has missing files declared: {missing}")
+        if state != "NODE_READY":
+            problems.append(f"PASS bundle has non-ready state: {state}")
+
     for name in REQUIRED:
-        if not (bundle / name).is_file() and name not in missing.split(","):
-            problems.append(f"required file missing: {name}")
+        if not (bundle / name).is_file():
+            if verdict == "PASS" or name not in missing.split(","):
+                problems.append(f"required file missing: {name}")
 
     listed = {entry["name"]: entry for entry in manifest.get("files", [])}
     for name, entry in listed.items():
@@ -70,9 +81,46 @@ def verify(bundle: Path) -> tuple[bool, list[str], dict]:
             path = bundle / name
             if not path.is_file() or sha256(path) != digest:
                 problems.append(f"SHA256SUMS mismatch: {name}")
-        for name in sorted(on_disk | {"manifest.json"}) :
+        for name in sorted(on_disk | {"manifest.json"}):
             if name not in seen:
                 problems.append(f"file not covered by SHA256SUMS: {name}")
+
+    # Semantic cross-file verification for PASS bundles
+    if verdict == "PASS" and not problems:
+        if (bundle / "gate-report.json").is_file():
+            gr = json.loads((bundle / "gate-report.json").read_text())
+            if gr.get("verdict") != "PASS":
+                problems.append(f"semantic mismatch: gate-report verdict is {gr.get('verdict')}")
+            if gr.get("state") != "NODE_READY":
+                problems.append(f"semantic mismatch: gate-report state is {gr.get('state')}")
+
+        if (bundle / "capability.json").is_file():
+            cap = json.loads((bundle / "capability.json").read_text())
+            if cap.get("verdict") != "PASS":
+                problems.append(f"semantic mismatch: capability verdict is {cap.get('verdict')}")
+            if cap.get("state") != "NODE_READY":
+                problems.append(f"semantic mismatch: capability state is {cap.get('state')}")
+            if cap.get("health", {}).get("cuda_smoke") != "PASS":
+                problems.append(f"semantic mismatch: capability cuda_smoke health is {cap.get('health', {}).get('cuda_smoke')}")
+            accs = cap.get("accelerators", [])
+            if not accs or not accs[0].get("uuid"):
+                problems.append("semantic mismatch: capability has no accelerator or missing GPU UUID")
+            net = cap.get("network", {})
+            if not net.get("interface") or not net.get("ipv4"):
+                problems.append("semantic mismatch: capability missing network interface or IPv4")
+
+        if (bundle / "cuda-smoke.json").is_file():
+            cs = json.loads((bundle / "cuda-smoke.json").read_text())
+            if cs.get("status") != "PASS":
+                problems.append(f"semantic mismatch: cuda-smoke status is {cs.get('status')}")
+            if not cs.get("compute_capability"):
+                problems.append("semantic mismatch: cuda-smoke missing compute_capability")
+
+        if (bundle / "pcie.json").is_file():
+            pcie = json.loads((bundle / "pcie.json").read_text())
+            if pcie.get("source") == "none" or not pcie.get("address"):
+                problems.append("semantic mismatch: pcie evidence has no GPU address or source is none")
+
     return not problems, problems, manifest
 
 

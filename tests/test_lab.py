@@ -306,20 +306,30 @@ class StateMachineTests(LabTestBase):
         lab.w(lab.fake / "ping.out", PING_DEAD)
         (lab.fake / "ping.rc").write_text("1\n")
         cap = lab.agent()
-        self.assertEqual(cap["state"], "NODE_READY")
+        self.assertEqual(cap["state"], "DEGRADED_LINK")
         self.assertEqual(cap["verdict"], "FAIL")
 
     def test_no_peer_configured_is_incomplete(self):
-        lab = self.lab(conf_extra="NODEOS_PEER_IPV4=\n")
+        lab = self.lab(conf_extra="NODEOS_PEER_IPV4=\nNODEOS_REQUIRE_PEER=0\n")
         cap = lab.agent()
         self.assertEqual(cap["state"], "NODE_READY")
         self.assertEqual(cap["verdict"], "INCOMPLETE")
+        self.assertFalse((lab.run_dir / "ready").exists())
+
+    def test_no_peer_configured_with_require_peer_blocks_state(self):
+        lab = self.lab(conf_extra="NODEOS_PEER_IPV4=\nNODEOS_REQUIRE_PEER=1\n")
+        cap = lab.agent()
+        self.assertEqual(cap["state"], "DEGRADED_LINK")
+        self.assertEqual(cap["state_reason"], "no-peer-configured")
+        self.assertEqual(cap["verdict"], "FAIL")
+        self.assertFalse((lab.run_dir / "ready").exists())
 
     def test_not_uefi_fails_verdict(self):
         lab = self.lab()
         shutil.rmtree(lab.sysfs / "firmware/efi")
         cap = lab.agent()
         self.assertEqual(cap["verdict"], "FAIL")
+        self.assertFalse((lab.run_dir / "ready").exists())
 
     def test_recovery_clears_ready_flag_and_logs_transition(self):
         lab = self.lab()
@@ -414,7 +424,7 @@ class EvidenceTests(LabTestBase):
         self.assertIn("lspci.txt", out.stdout)
 
     def test_incomplete_banner_when_peer_unmeasured(self):
-        lab = self.lab(conf_extra="NODEOS_PEER_IPV4=\n")
+        lab = self.lab(conf_extra="NODEOS_PEER_IPV4=\nNODEOS_REQUIRE_PEER=0\n")
         self.assertIn("PHYSICAL INCOMPLETE", self.collect(lab).stdout)
 
     def test_export_tar_roundtrip(self):
@@ -491,6 +501,18 @@ class ConsoleTests(LabTestBase):
     def test_frame_without_agent(self):
         lab = self.lab()
         self.assertIn("waiting for nodeos-agent", lab.run("nodeos-console", "--once").stdout)
+
+    def test_compact_layout_rendering(self):
+        lab = self.lab()
+        lab.agent()
+        proc = subprocess.run([SH, "-c", f'. "{SRC / "nodeos-lib.sh"}"; . "{SRC / "nodeos-console"}"; render_compact'],
+                              env=lab.env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        frame = proc.stdout
+        self.assertIn("(Compact)", frame)
+        self.assertIn("STATE NODE_READY", frame)
+        widths = {len(line) for line in frame.splitlines() if line.startswith(("|", "+"))}
+        self.assertEqual(widths, {80})
 
 
 @unittest.skipUnless(HAVE_SH, "POSIX sh required")
@@ -576,7 +598,8 @@ class StaticContractTests(unittest.TestCase):
 
     def test_1070ti_profile_requires_the_direct_lan_peer(self):
         conf = (OVERLAY / "rootfs-overlay/etc/nodeos/nodeos.conf").read_text()
-        for needle in ("NODEOS_REQUIRE_PEER=1", "NODEOS_MIN_LINK_MBIT=1000", "NODEOS_IPERF_SERVER=1"):
+        for needle in ("NODEOS_REQUIRE_PEER=1", "NODEOS_MIN_LINK_MBIT=1000", "NODEOS_IPERF_SERVER=1",
+                       "NODEOS_EXPECTED_CC=6.1", 'NODEOS_GPU_PROFILE="GTX 1070 Ti / Pascal / sm_61"'):
             self.assertIn(needle, conf)
 
     def test_contracts_are_valid_json_with_expected_ids(self):

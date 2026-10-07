@@ -86,15 +86,25 @@ pcie_collect() {
         PCIE_CUR_WIDTH=$(num_or_empty "$SMI_W_CUR"); PCIE_MAX_WIDTH=$(num_or_empty "$SMI_W_MAX")
         [ -z "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ] || PCIE_SOURCE=nvidia-smi
     fi
-    # Idle GPUs legitimately downtrain; remember the best link seen this boot.
+    # Idle GPUs legitimately downtrain; remember the best observed link pair (gen, width) seen this boot.
     _bf="$NODEOS_RUN/pcie-best.env"
     BEST_GEN=""; BEST_WIDTH=""
     if [ -r "$_bf" ]; then . "$_bf"; fi
-    BEST_GEN=$(max_num "${BEST_GEN:-}" "$PCIE_CUR_GEN")
-    BEST_WIDTH=$(max_num "${BEST_WIDTH:-}" "$PCIE_CUR_WIDTH")
-    printf 'BEST_GEN=%s\nBEST_WIDTH=%s\n' "$(sq "$BEST_GEN")" "$(sq "$BEST_WIDTH")" >"$_bf.$$"
+    if [ -n "${PCIE_CUR_GEN:-}" ] && [ -n "${PCIE_CUR_WIDTH:-}" ]; then
+        _cur_score=$((PCIE_CUR_GEN * PCIE_CUR_WIDTH))
+        _best_score=0
+        if [ -n "${BEST_GEN:-}" ] && [ -n "${BEST_WIDTH:-}" ]; then
+            _best_score=$((BEST_GEN * BEST_WIDTH))
+        fi
+        if [ "$_cur_score" -gt "$_best_score" ] || \
+           { [ "$_cur_score" -eq "$_best_score" ] && [ "$PCIE_CUR_GEN" -gt "${BEST_GEN:-0}" ]; }; then
+            BEST_GEN=$PCIE_CUR_GEN
+            BEST_WIDTH=$PCIE_CUR_WIDTH
+        fi
+    fi
+    printf 'BEST_GEN=%s\nBEST_WIDTH=%s\n' "$(sq "${BEST_GEN:-}")" "$(sq "${BEST_WIDTH:-}")" >"$_bf.$$"
     mv -f "$_bf.$$" "$_bf"
-    PCIE_BEST_GEN=$BEST_GEN; PCIE_BEST_WIDTH=$BEST_WIDTH
+    PCIE_BEST_GEN=${BEST_GEN:-}; PCIE_BEST_WIDTH=${BEST_WIDTH:-}
     PCIE_DOWNTRAINED=""
     if [ -n "$PCIE_CUR_GEN$PCIE_CUR_WIDTH" ] && [ -n "$PCIE_MAX_GEN" ] && [ -n "$PCIE_MAX_WIDTH" ] &&
        [ -n "$PCIE_CUR_GEN" ] && [ -n "$PCIE_CUR_WIDTH" ]; then
@@ -191,9 +201,12 @@ compute_state() {
     for _g in $NODEOS_CHAIN; do
         _st=$(gv "$_g"); _rs=$(gv "$_g" _REASON)
         _ok=0
-        [ "$_st" != PASS ] || _ok=1
-        if [ "$_g" = network ]; then
-            if [ "${NODEOS_REQUIRE_PEER:-0}" != 1 ] || [ "$_st" = SKIPPED ]; then _ok=1; fi
+        if [ "$_st" = PASS ]; then
+            _ok=1
+        elif [ "$_g" = network ] && [ "${NODEOS_REQUIRE_PEER:-0}" != 1 ]; then
+            if [ "$_st" = SKIPPED ] || [ "$_st" = NA ]; then
+                _ok=1
+            fi
         fi
         if [ "$_ok" = 1 ]; then STAGE=$(nodeos_stage_of "$_g"); continue; fi
         STATE=$(nodeos_blocked_of "$_g" "$_rs"); STATE_REASON=$_rs
@@ -344,9 +357,12 @@ maybe_evidence() {
     LAST_SIG=$_sig
     [ "$STABLE" -ge "${NODEOS_EVIDENCE_STABLE_CYCLES:-3}" ] || return 0
     [ "$(rd "$NODEOS_RUN/evidence.sig")" != "$_sig" ] || return 0
-    printf '%s\n' "$_sig" >"$NODEOS_RUN/evidence.sig"
     if [ -x "$NODEOS_BIN/nodeos-evidence" ]; then
-        "$NODEOS_BIN/nodeos-evidence" collect --auto >/dev/null 2>&1 || nlog "EVIDENCE collection failed"
+        if "$NODEOS_BIN/nodeos-evidence" collect --auto >/dev/null 2>&1; then
+            printf '%s\n' "$_sig" >"$NODEOS_RUN/evidence.sig"
+        else
+            nlog "EVIDENCE collection failed"
+        fi
     fi
 }
 
@@ -387,7 +403,11 @@ collect_once() {
     write_gate_report
     write_capability
     write_status_env
-    if [ "$STATE" = NODE_READY ]; then : >"$NODEOS_RUN/ready"; else rm -f "$NODEOS_RUN/ready"; fi
+    if [ "$STATE" = NODE_READY ] && [ "$VERDICT" = PASS ]; then
+        : >"$NODEOS_RUN/ready"
+    else
+        rm -f "$NODEOS_RUN/ready"
+    fi
 }
 
 case "${1:-run}" in
